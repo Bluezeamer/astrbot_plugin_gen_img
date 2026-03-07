@@ -1,0 +1,140 @@
+{
+    "fallback_to_event_images": {
+        "description": "Agent 未传入图片时回退读取消息图片",
+        "type": "bool",
+        "default": true,
+        "hint": "当 Agent 调用工具时未传入 image_urls 参数，自动从当前消息/引用消息中提取图片。"
+    },
+    "default_image_config": {
+        "description": "默认图片生成参数",
+        "type": "object",
+        "hint": "控制生成图片的宽高比和分辨率，对应 OpenRouter 的 image_config 字段。",
+        "items": {
+            "aspect_ratio": {
+                "description": "宽高比",
+                "type": "string",
+                "options": [
+                    "default",
+                    "1:1",
+                    "2:3",
+                    "3:2",
+                    "3:4",
+                    "4:3",
+                    "9:16",
+                    "16:9"
+                ],
+                "default": "default",
+                "hint": "设为 default 时不发送此参数，由模型自行决定。"
+            },
+            "image_size": {
+                "description": "图片尺寸",
+                "type": "string",
+                "options": [
+                    "default",
+                    "1K",
+                    "2K"
+                ],
+                "default": "1K",
+                "hint": "对应 OpenRouter 请求中的 image_config.image_size。"
+            }
+        }
+    },
+    "openrouter": {
+        "description": "OpenRouter 提供商配置（主）",
+        "type": "object",
+        "hint": "优先使用此提供商，失败时自动降级到备用提供商。",
+        "items": {
+            "enabled": {
+                "description": "是否启用 OpenRouter",
+                "type": "bool",
+                "default": true
+            },
+            "api_key": {
+                "description": "OpenRouter API Key",
+                "type": "string",
+                "default": "",
+                "hint": "不需要填写 Bearer 前缀。"
+            },
+            "base_url": {
+                "description": "Chat Completions 端点地址",
+                "type": "string",
+                "default": "https://openrouter.ai/api/v1/chat/completions"
+            },
+            "model": {
+                "description": "模型名称",
+                "type": "string",
+                "default": "google/gemini-3.1-flash-image-preview",
+                "hint": "OpenRouter 上的模型标识。"
+            }
+        }
+    },
+    "newapi": {
+        "description": "NewAPI 中转配置（备用）",
+        "type": "object",
+        "hint": "当主提供商限流、无图或重试耗尽时自动降级到此提供商。",
+        "items": {
+            "enabled": {
+                "description": "是否启用 NewAPI 中转",
+                "type": "bool",
+                "default": false
+            },
+            "api_key": {
+                "description": "NewAPI API Key",
+                "type": "string",
+                "default": "",
+                "hint": "不需要填写 Bearer 前缀。"
+            },
+            "base_url": {
+                "description": "Chat Completions 端点地址",
+                "type": "string",
+                "default": "",
+                "hint": "如 http://your-newapi-host/v1/chat/completions"
+            },
+            "model": {
+                "description": "模型名称",
+                "type": "string",
+                "default": "",
+                "hint": "NewAPI 上配置的模型名，如 gemini-3.1-flash-image-preview-2k。"
+            }
+        }
+    },
+    "request": {
+        "description": "请求参数配置",
+        "type": "object",
+        "items": {
+            "timeout": {
+                "description": "请求超时时间（秒）",
+                "type": "int",
+                "default": 120,
+                "hint": "图片生成通常需要较长时间，建议不低于 60 秒。"
+            },
+            "max_retry": {
+                "description": "每个提供商的最大重试次数",
+                "type": "int",
+                "default": 2,
+                "hint": "仅对 408、5xx、超时、网络异常生效。"
+            }
+        }
+    },
+    "image": {
+        "description": "输入图片相关配置",
+        "type": "object",
+        "items": {
+            "max_input_images": {
+                "description": "最多读取的参考图片数量",
+                "type": "int",
+                "default": 3
+            },
+            "max_input_mb": {
+                "description": "单张图片最大大小（MB）",
+                "type": "int",
+                "default": 20
+            },
+            "allow_reply_image": {
+                "description": "是否读取引用/回复消息中的图片",
+                "type": "bool",
+                "default": true
+            }
+        }
+    }
+}

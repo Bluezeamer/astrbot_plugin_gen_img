@@ -1,0 +1,6 @@
+astrbot_plugin_big_banana/
+__pycache__/
+*.pyc
+*.pyo
+temp/
+.env
