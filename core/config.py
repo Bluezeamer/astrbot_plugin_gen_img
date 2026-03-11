@@ -289,38 +289,111 @@ def _parse_model_groups(
     return groups
 
 
+def _auto_endpoint_name(seen: set[str], start: int = 1) -> tuple[str, int]:
+    """生成不与已有名称冲突的自动端点名，返回 (名称, 下一起始序号)。"""
+    idx = max(1, start)
+    while f"endpoint-{idx}" in seen:
+        idx += 1
+    return f"endpoint-{idx}", idx + 1
+
+
+def _parse_endpoints_text(raw: str) -> list[EndpointConfig]:
+    """解析多行文本格式的端点列表。
+
+    每行格式：
+        名称 | base_url | api_key | model   （4 段）
+        base_url | api_key | model           （3 段，自动编号）
+    空行和 # 开头的行忽略。
+    """
+    endpoints: list[EndpointConfig] = []
+    seen: set[str] = set()
+    next_idx = 1
+
+    for line_no, raw_line in enumerate(raw.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        parts = [p.strip() for p in line.split("|")]
+
+        if len(parts) == 3:
+            base_url, api_key, model = parts
+            ep_name, next_idx = _auto_endpoint_name(seen, next_idx)
+        elif len(parts) == 4:
+            ep_name, base_url, api_key, model = parts
+            if not ep_name:
+                ep_name, next_idx = _auto_endpoint_name(seen, next_idx)
+        else:
+            # 日志仅记行号，不输出原文（含 api_key）
+            logger.warning(
+                f"[gen_img] endpoints 第 {line_no} 行格式错误"
+                f"（期望 3 或 4 段，实际 {len(parts)} 段），已跳过"
+            )
+            continue
+
+        if not base_url or not model:
+            logger.warning(
+                f"[gen_img] endpoints 第 {line_no} 行缺少地址或模型名，已跳过"
+            )
+            continue
+
+        if ep_name in seen:
+            logger.warning(f"[gen_img] 跳过重复的端点名: {ep_name}")
+            continue
+        seen.add(ep_name)
+
+        endpoints.append(
+            EndpointConfig(
+                name=ep_name,
+                enabled=True,
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+            )
+        )
+
+    return endpoints
+
+
 def _parse_endpoints(value: Any) -> list[EndpointConfig]:
-    """解析端点列表，兼容 template_list 返回的 list[dict] 和 JSON 字符串。"""
+    """解析端点列表，兼容多行文本、list[dict] 和 JSON 字符串。"""
     if isinstance(value, str):
         raw = value.strip()
         if not raw:
             return []
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError:
-            logger.warning("[gen_img] endpoints JSON 解析失败")
-            return []
+        # 以 [ 或 { 开头的字符串优先尝试 JSON 解析（旧格式兼容）
+        if raw[0] in "[{":
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning("[gen_img] endpoints JSON 解析失败，回退为多行文本解析")
+            else:
+                return _parse_endpoints(parsed)
+        # 非 JSON 字符串按多行文本格式解析
+        return _parse_endpoints_text(raw)
+
     if isinstance(value, dict):
         value = [value]
     if not isinstance(value, list):
         return []
 
     endpoints: list[EndpointConfig] = []
-    seen_names: set[str] = set()
+    seen: set[str] = set()
+    next_idx = 1
 
-    for index, item in enumerate(value, start=1):
+    for item in value:
         ep_data = _as_dict(item)
         if not ep_data:
             continue
 
         ep_name = _str(ep_data.get("name"), "").strip()
         if not ep_name:
-            ep_name = f"endpoint-{index}"
+            ep_name, next_idx = _auto_endpoint_name(seen, next_idx)
 
-        if ep_name in seen_names:
+        if ep_name in seen:
             logger.warning(f"[gen_img] 跳过重复的端点名: {ep_name}")
             continue
-        seen_names.add(ep_name)
+        seen.add(ep_name)
 
         endpoints.append(
             EndpointConfig(

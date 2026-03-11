@@ -116,45 +116,10 @@
                         "hint": "inherit 表示继承全局 default_image_config 的值。"
                     },
                     "endpoints": {
-                        "description": "端点列表",
-                        "type": "template_list",
-                        "hint": "同一模型组内的端点按配置顺序依次尝试，第一个失败后降级到下一个。",
-                        "templates": {
-                            "endpoint": {
-                                "name": "API 端点",
-                                "items": {
-                                    "name": {
-                                        "description": "端点名称",
-                                        "type": "string",
-                                        "default": "",
-                                        "hint": "仅用于日志和状态显示，如 openrouter、newapi-backup。"
-                                    },
-                                    "enabled": {
-                                        "description": "是否启用",
-                                        "type": "bool",
-                                        "default": true
-                                    },
-                                    "api_key": {
-                                        "description": "API Key",
-                                        "type": "string",
-                                        "default": "",
-                                        "hint": "不需要填写 Bearer 前缀。"
-                                    },
-                                    "base_url": {
-                                        "description": "Chat Completions 端点地址",
-                                        "type": "string",
-                                        "default": "",
-                                        "hint": "完整的 URL，如 https://openrouter.ai/api/v1/chat/completions"
-                                    },
-                                    "model": {
-                                        "description": "模型名称",
-                                        "type": "string",
-                                        "default": "",
-                                        "hint": "该端点使用的模型标识，如 google/gemini-3.1-flash-image-preview。"
-                                    }
-                                }
-                            }
-                        }
+                        "description": "端点列表（每行一个，从上到下依次降级）",
+                        "type": "text",
+                        "default": "# 格式：端点名称 | 地址 | API Key | 模型（端点名称可省略）\n# openrouter | https://openrouter.ai/api/v1/chat/completions | sk-xxx | google/gemini-3.1-flash-image-preview",
+                        "hint": "每行一个端点，字段用 | 分隔。支持 4 段（名称|地址|密钥|模型）或 3 段（地址|密钥|模型，自动编号）。空行和 # 开头的行会忽略。如需禁用某端点，在行首加 # 即可。"
                     }
                 }
             }

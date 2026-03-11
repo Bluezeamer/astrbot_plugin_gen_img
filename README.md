@@ -55,15 +55,31 @@ git clone <repo_url> astrbot_plugin_gen_img
 
 ### 端点（endpoints）
 
-每个模型组内可配置多个 API 端点，按顺序降级：
+每个模型组内的 `endpoints` 使用**多行文本**配置，按从上到下顺序降级路由。每行一个端点，字段用 `|` 分隔：
 
-| 字段 | 说明 |
-|------|------|
-| `name` | 端点名称，用于日志显示（如 `openrouter`、`newapi-backup`） |
-| `enabled` | 是否启用 |
-| `api_key` | API Key（无需 Bearer 前缀） |
-| `base_url` | Chat Completions 端点地址（如 `https://openrouter.ai/api/v1/chat/completions`） |
-| `model` | 模型标识（如 `google/gemini-3.1-flash-image-preview`） |
+```text
+端点名称 | base_url | api_key | model
+```
+
+端点名称可省略（自动编号为 `endpoint-1`、`endpoint-2` ...）：
+
+```text
+base_url | api_key | model
+```
+
+示例：
+
+```text
+openrouter | https://openrouter.ai/api/v1/chat/completions | sk-xxx | google/gemini-3.1-flash-image-preview
+newapi | https://your-newapi.com/v1/chat/completions | sk-yyy | gemini-image
+# backup | https://backup.example.com/v1/chat/completions | sk-zzz | gemini-image
+```
+
+规则：
+- 空行和 `#` 开头的行会忽略（可用于注释或临时禁用）
+- 所有端点默认启用，不需要单独的开关字段
+- 字段值本身不要包含 `|`
+- API Key 无需 `Bearer` 前缀；本地部署的端点可留空
 
 ### 全局默认参数
 
@@ -111,7 +127,7 @@ Agent 调用 `gen_img` 时可传入以下参数：
 
 ## 旧配置兼容
 
-从 v0.1.x 升级时，插件会自动识别旧的 `openrouter`/`newapi` 配置并迁移为一个名为 `default` 的模型组。建议升级后在管理面板中重新配置模型组。
+从 v0.1.x 升级时，插件会自动识别旧的 `openrouter`/`newapi` 配置并迁移为一个名为 `default` 的模型组。旧版 `endpoints` 的 JSON 格式在运行时仍可解析，但 WebUI 不会自动转换为新的多行文本格式，建议升级后在管理面板中按新格式重新保存一次。
 
 ## 依赖
 
