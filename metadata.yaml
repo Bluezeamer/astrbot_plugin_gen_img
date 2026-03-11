@@ -1,6 +1,6 @@
 name: astrbot_plugin_gen_img
 display_name: "图片生成"
-version: "0.1.0"
+version: "0.2.0"
 astrbot_version: ">=4.10,<5"
-description: "NanoBanana2 图生图插件，支持 OpenRouter 和 NewAPI 中转，通过 Agent 工具调用"
+description: "基于动态模型组的图片生成插件，支持多个 OpenAI 兼容端点按组路由与降级，通过 Agent 工具调用"
 author: "用户"

@@ -1,6 +1,6 @@
 """OpenAI 兼容提供商：请求构造与响应解析。
 
-支持 OpenRouter 和 NewAPI 中转的 /v1/chat/completions 端点。
+支持任意 OpenAI 兼容 /v1/chat/completions 端点。
 响应解析覆盖四种图片返回格式：
 1. OpenRouter message.images[] 结构化数组（优先）
 2. markdown data URI（base64 内联）
@@ -20,7 +20,7 @@ from typing import Any
 import aiohttp
 from astrbot.api import logger
 
-from .config import ImageConfig, ImageOutputConfig, ProviderConfig, RequestConfig
+from .config import EndpointConfig, ImageOutputConfig, RequestConfig
 from .image_extract import download_image, encode_image
 
 # 匹配 data:image/...;base64,... 格式
@@ -54,17 +54,15 @@ class OpenAICompatibleProvider:
     def __init__(
         self,
         name: str,
-        config: ProviderConfig,
+        config: EndpointConfig,
         session: aiohttp.ClientSession,
         request_config: RequestConfig,
-        image_config: ImageConfig,
         output_config: ImageOutputConfig,
     ) -> None:
         self.name = name
         self.config = config
         self.session = session
         self.request_config = request_config
-        self.image_config = image_config
         self.output_config = output_config
 
     async def generate(
@@ -131,7 +129,7 @@ class OpenAICompatibleProvider:
             "modalities": ["image", "text"],
             "stream": False,
         }
-        # 添加 image_config（OpenRouter 特有，NewAPI 中转通常忽略）
+        # 添加 image_config（部分 OpenAI 兼容端点可能忽略此字段）
         image_payload = self.output_config.to_payload()
         if image_payload:
             payload["image_config"] = image_payload

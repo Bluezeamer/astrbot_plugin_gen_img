@@ -1,77 +1,107 @@
 """AstrBot 图片生成插件入口。
 
-通过 LLM FunctionTool 机制注册图生图工具，
-Agent 推理后调用，插件负责与 OpenRouter/NewAPI 交互。
+通过 LLM FunctionTool 机制注册图片生成工具，
+Agent 推理后调用，插件负责按模型组路由到具体端点。
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import aiohttp
 from astrbot.api import logger
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core import AstrBotConfig
 
-from .core.config import PluginConfig
+from .core.config import ModelGroupConfig, PluginConfig
 from .core.provider import OpenAICompatibleProvider
 from .core.router import ProviderRouter
 from .core.tool import TOOL_NAME, GenImgTool
 
 
-@register("astrbot_plugin_gen_img", "用户", "NanoBanana2 图生图插件", "0.1.0")
+@dataclass
+class RuntimeModelGroup:
+    """模型组运行时实例。"""
+
+    config: ModelGroupConfig
+    router: ProviderRouter
+
+
+@register("astrbot_plugin_gen_img", "用户", "动态模型组图片生成插件", "0.2.0")
 class Main(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.raw_config = config
         self.config = PluginConfig.from_dict(config)
         self.session: aiohttp.ClientSession | None = None
-        self.router: ProviderRouter | None = None
+        self.runtime_groups: dict[str, RuntimeModelGroup] = {}
         self._tool: GenImgTool | None = None
 
     async def initialize(self):
-        """异步初始化：创建 HTTP 会话、装配提供商、注册 LLM 工具。"""
+        """异步初始化：创建 HTTP 会话、装配模型组、注册 LLM 工具。"""
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=self.config.request.timeout),
-            headers={"User-Agent": "astrbot-plugin-gen-img/0.1.0"},
+            headers={"User-Agent": "astrbot-plugin-gen-img/0.2.0"},
         )
 
-        # 按优先级装配提供商：openrouter（主） → newapi（备）
-        providers: list[OpenAICompatibleProvider] = []
+        self.runtime_groups = {}
 
-        if self.config.openrouter.enabled:
-            providers.append(
-                OpenAICompatibleProvider(
-                    name="openrouter",
-                    config=self.config.openrouter,
-                    session=self.session,
-                    request_config=self.config.request,
-                    image_config=self.config.image,
-                    output_config=self.config.default_image_config,
+        for group_cfg in self.config.model_groups:
+            group_name = group_cfg.group_name
+            if not group_name:
+                logger.warning("[gen_img] 跳过未命名模型组")
+                continue
+
+            if group_name in self.runtime_groups:
+                logger.warning(f"[gen_img] 跳过重复模型组: {group_name}")
+                continue
+
+            if not (group_cfg.support_img2img or group_cfg.support_txt2img):
+                logger.warning(
+                    f"[gen_img] 跳过模型组 {group_name}: 未启用任何操作类型"
                 )
-            )
+                continue
 
-        if self.config.newapi.enabled:
-            providers.append(
-                OpenAICompatibleProvider(
-                    name="newapi",
-                    config=self.config.newapi,
-                    session=self.session,
-                    request_config=self.config.request,
-                    image_config=self.config.image,
-                    output_config=self.config.default_image_config,
+            # 按顺序构建端点 Provider 列表
+            providers: list[OpenAICompatibleProvider] = []
+            for ep in group_cfg.endpoints:
+                if not ep.enabled:
+                    continue
+                ep_name = ep.name or "unnamed"
+                providers.append(
+                    OpenAICompatibleProvider(
+                        name=f"{group_name}/{ep_name}",
+                        config=ep,
+                        session=self.session,
+                        request_config=self.config.request,
+                        output_config=group_cfg.output_config,
+                    )
                 )
+
+            if not providers:
+                logger.warning(f"[gen_img] 跳过模型组 {group_name}: 无启用端点")
+                continue
+
+            self.runtime_groups[group_name] = RuntimeModelGroup(
+                config=group_cfg,
+                router=ProviderRouter(
+                    providers=providers,
+                    max_retry=self.config.request.max_retry,
+                ),
             )
+            ep_names = ", ".join(p.name for p in providers)
+            logger.info(f"[gen_img] 已装配模型组 {group_name}: {ep_names}")
 
-        self.router = ProviderRouter(
-            providers=providers,
-            max_retry=self.config.request.max_retry,
-        )
+        # 仅在有可用模型组时注册 LLM 工具
+        if self.runtime_groups:
+            self._tool = GenImgTool(plugin=self)
+            self.context.add_llm_tools(self._tool)
 
-        # 注册 LLM 工具
-        self._tool = GenImgTool(plugin=self)
-        self.context.add_llm_tools(self._tool)
-
-        names = ", ".join(p.name for p in providers) or "无"
-        logger.info(f"[gen_img] 插件初始化完成，可用提供商: {names}")
+            names = ", ".join(self.runtime_groups.keys())
+            logger.info(f"[gen_img] 插件初始化完成，可用模型组: {names}")
+        else:
+            self._tool = None
+            logger.warning("[gen_img] 未发现可用模型组，跳过 LLM 工具注册")
 
     async def terminate(self):
         """插件卸载：关闭 HTTP 会话、注销 LLM 工具。"""
@@ -83,3 +113,6 @@ class Main(Star):
         if tool_mgr.get_func(TOOL_NAME):
             StarTools.unregister_llm_tool(TOOL_NAME)
             logger.info(f"[gen_img] 已注销 LLM 工具 {TOOL_NAME}")
+
+        self.runtime_groups = {}
+        self._tool = None

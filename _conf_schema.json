@@ -8,7 +8,7 @@
     "default_image_config": {
         "description": "默认图片生成参数",
         "type": "object",
-        "hint": "控制生成图片的宽高比和分辨率，对应 OpenRouter 的 image_config 字段。",
+        "hint": "模型组未覆盖时的默认输出参数，对应 OpenAI 兼容请求中的 image_config 字段。",
         "items": {
             "aspect_ratio": {
                 "description": "宽高比",
@@ -35,66 +35,128 @@
                     "2K"
                 ],
                 "default": "1K",
-                "hint": "对应 OpenRouter 请求中的 image_config.image_size。"
+                "hint": "对应请求中的 image_config.image_size。"
             }
         }
     },
-    "openrouter": {
-        "description": "OpenRouter 提供商配置（主）",
-        "type": "object",
-        "hint": "优先使用此提供商，失败时自动降级到备用提供商。",
-        "items": {
-            "enabled": {
-                "description": "是否启用 OpenRouter",
-                "type": "bool",
-                "default": true
-            },
-            "api_key": {
-                "description": "OpenRouter API Key",
-                "type": "string",
-                "default": "",
-                "hint": "不需要填写 Bearer 前缀。"
-            },
-            "base_url": {
-                "description": "Chat Completions 端点地址",
-                "type": "string",
-                "default": "https://openrouter.ai/api/v1/chat/completions"
-            },
-            "model": {
-                "description": "模型名称",
-                "type": "string",
-                "default": "google/gemini-3.1-flash-image-preview",
-                "hint": "OpenRouter 上的模型标识。"
-            }
-        }
-    },
-    "newapi": {
-        "description": "NewAPI 中转配置（备用）",
-        "type": "object",
-        "hint": "当主提供商限流、无图或重试耗尽时自动降级到此提供商。",
-        "items": {
-            "enabled": {
-                "description": "是否启用 NewAPI 中转",
-                "type": "bool",
-                "default": false
-            },
-            "api_key": {
-                "description": "NewAPI API Key",
-                "type": "string",
-                "default": "",
-                "hint": "不需要填写 Bearer 前缀。"
-            },
-            "base_url": {
-                "description": "Chat Completions 端点地址",
-                "type": "string",
-                "default": "",
-                "hint": "如 http://your-newapi-host/v1/chat/completions"
-            },
-            "model": {
-                "description": "模型名称",
-                "type": "string",
-                "default": "",
-                "hint": "NewAPI 上配置的模型名，如 gemini-3.1-flash-image-preview-2k。"
+    "model_groups": {
+        "description": "模型组配置",
+        "type": "template_list",
+        "hint": "每个模型组代表一种图片生成能力（如风格迁移、文生图等）。组内端点按顺序降级：第一个失败后自动尝试下一个。",
+        "templates": {
+            "openai_compatible": {
+                "name": "OpenAI 兼容模型组",
+                "hint": "适用于所有兼容 OpenAI Chat Completions 协议的端点（OpenRouter、NewAPI、火山引擎等）。",
+                "items": {
+                    "group_name": {
+                        "description": "模型组名称",
+                        "type": "string",
+                        "default": "",
+                        "hint": "唯一标识，Agent 通过此名称选择模型组。建议使用简短英文如 style_transfer、txt2img。"
+                    },
+                    "group_description": {
+                        "description": "模型组简短描述",
+                        "type": "string",
+                        "default": "",
+                        "hint": "显示在 Agent 工具说明中，帮助 Agent 理解该模型组的用途和擅长场景。"
+                    },
+                    "guide": {
+                        "description": "Prompt 构建指南（给 Agent 看）",
+                        "type": "text",
+                        "default": "",
+                        "hint": "教 Agent 如何为此模型构建最优 prompt 的详细指南。Agent 可先不传 prompt 来获取此指南。留空表示无需额外指导。此内容不会拼入最终 API 请求。"
+                    },
+                    "support_img2img": {
+                        "description": "支持图生图",
+                        "type": "bool",
+                        "default": true
+                    },
+                    "support_txt2img": {
+                        "description": "支持文生图",
+                        "type": "bool",
+                        "default": false
+                    },
+                    "default_operation": {
+                        "description": "默认操作类型",
+                        "type": "string",
+                        "options": [
+                            "img2img",
+                            "txt2img"
+                        ],
+                        "default": "img2img",
+                        "hint": "Agent 未指定 operation 时使用此默认值。"
+                    },
+                    "aspect_ratio_override": {
+                        "description": "宽高比覆盖",
+                        "type": "string",
+                        "options": [
+                            "inherit",
+                            "default",
+                            "1:1",
+                            "2:3",
+                            "3:2",
+                            "3:4",
+                            "4:3",
+                            "9:16",
+                            "16:9"
+                        ],
+                        "default": "inherit",
+                        "hint": "inherit 表示继承全局 default_image_config 的值。"
+                    },
+                    "image_size_override": {
+                        "description": "图片尺寸覆盖",
+                        "type": "string",
+                        "options": [
+                            "inherit",
+                            "default",
+                            "1K",
+                            "2K"
+                        ],
+                        "default": "inherit",
+                        "hint": "inherit 表示继承全局 default_image_config 的值。"
+                    },
+                    "endpoints": {
+                        "description": "端点列表",
+                        "type": "template_list",
+                        "hint": "同一模型组内的端点按配置顺序依次尝试，第一个失败后降级到下一个。",
+                        "templates": {
+                            "endpoint": {
+                                "name": "API 端点",
+                                "items": {
+                                    "name": {
+                                        "description": "端点名称",
+                                        "type": "string",
+                                        "default": "",
+                                        "hint": "仅用于日志和状态显示，如 openrouter、newapi-backup。"
+                                    },
+                                    "enabled": {
+                                        "description": "是否启用",
+                                        "type": "bool",
+                                        "default": true
+                                    },
+                                    "api_key": {
+                                        "description": "API Key",
+                                        "type": "string",
+                                        "default": "",
+                                        "hint": "不需要填写 Bearer 前缀。"
+                                    },
+                                    "base_url": {
+                                        "description": "Chat Completions 端点地址",
+                                        "type": "string",
+                                        "default": "",
+                                        "hint": "完整的 URL，如 https://openrouter.ai/api/v1/chat/completions"
+                                    },
+                                    "model": {
+                                        "description": "模型名称",
+                                        "type": "string",
+                                        "default": "",
+                                        "hint": "该端点使用的模型标识，如 google/gemini-3.1-flash-image-preview。"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     },
@@ -109,7 +171,7 @@
                 "hint": "图片生成通常需要较长时间，建议不低于 60 秒。"
             },
             "max_retry": {
-                "description": "每个提供商的最大重试次数",
+                "description": "每个端点的最大重试次数",
                 "type": "int",
                 "default": 2,
                 "hint": "仅对 408、5xx、超时、网络异常生效。"

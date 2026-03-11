@@ -6,11 +6,16 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from astrbot.api import logger
+
 
 # ── 类型转换辅助 ──────────────────────────────────────────
+
+_MISSING = object()
 
 
 def _get(data: Any, key: str, default: Any = None) -> Any:
@@ -73,8 +78,11 @@ def _str(value: Any, default: str) -> str:
 
 
 @dataclass
-class ProviderConfig:
-    enabled: bool = False
+class EndpointConfig:
+    """单个 API 端点配置。"""
+
+    name: str = ""
+    enabled: bool = True
     api_key: str = ""
     base_url: str = ""
     model: str = ""
@@ -95,7 +103,7 @@ class ImageConfig:
 
 @dataclass
 class ImageOutputConfig:
-    """图片生成输出参数，对应 OpenRouter 的 image_config 字段。"""
+    """图片生成输出参数，对应 OpenAI 兼容接口的 image_config 字段。"""
 
     aspect_ratio: str = "default"
     image_size: str = "1K"
@@ -111,17 +119,24 @@ class ImageOutputConfig:
 
 
 @dataclass
+class ModelGroupConfig:
+    """模型组配置。"""
+
+    group_name: str = ""
+    group_description: str = ""
+    guide: str = ""
+    support_img2img: bool = True
+    support_txt2img: bool = False
+    default_operation: str = "img2img"
+    output_config: ImageOutputConfig = field(default_factory=ImageOutputConfig)
+    endpoints: list[EndpointConfig] = field(default_factory=list)
+
+
+@dataclass
 class PluginConfig:
     fallback_to_event_images: bool = True
     default_image_config: ImageOutputConfig = field(default_factory=ImageOutputConfig)
-    openrouter: ProviderConfig = field(
-        default_factory=lambda: ProviderConfig(
-            enabled=True,
-            base_url="https://openrouter.ai/api/v1/chat/completions",
-            model="google/gemini-3.1-flash-image-preview",
-        )
-    )
-    newapi: ProviderConfig = field(default_factory=ProviderConfig)
+    model_groups: list[ModelGroupConfig] = field(default_factory=list)
     request: RequestConfig = field(default_factory=RequestConfig)
     image: ImageConfig = field(default_factory=ImageConfig)
 
@@ -131,38 +146,34 @@ class PluginConfig:
         defaults = cls()
 
         ic_data = _as_dict(_get(data, "default_image_config", {}))
-        or_data = _as_dict(_get(data, "openrouter", {}))
-        na_data = _as_dict(_get(data, "newapi", {}))
         rq_data = _as_dict(_get(data, "request", {}))
         im_data = _as_dict(_get(data, "image", {}))
+
+        default_image_config = ImageOutputConfig(
+            aspect_ratio=_str(
+                ic_data.get("aspect_ratio"),
+                defaults.default_image_config.aspect_ratio,
+            ),
+            image_size=_str(
+                ic_data.get("image_size"),
+                defaults.default_image_config.image_size,
+            ),
+        )
+
+        # 优先级：字段存在 → 使用新格式（即使为空也不回退）；字段不存在 → 旧格式迁移
+        raw_groups = _get(data, "model_groups", _MISSING)
+        if raw_groups is not _MISSING:
+            model_groups = _parse_model_groups(raw_groups, default_image_config)
+        else:
+            model_groups = _migrate_legacy_config(data, default_image_config)
 
         return cls(
             fallback_to_event_images=_bool(
                 _get(data, "fallback_to_event_images"),
                 defaults.fallback_to_event_images,
             ),
-            default_image_config=ImageOutputConfig(
-                aspect_ratio=_str(
-                    ic_data.get("aspect_ratio"),
-                    defaults.default_image_config.aspect_ratio,
-                ),
-                image_size=_str(
-                    ic_data.get("image_size"),
-                    defaults.default_image_config.image_size,
-                ),
-            ),
-            openrouter=ProviderConfig(
-                enabled=_bool(or_data.get("enabled"), defaults.openrouter.enabled),
-                api_key=_str(or_data.get("api_key"), defaults.openrouter.api_key),
-                base_url=_str(or_data.get("base_url"), defaults.openrouter.base_url),
-                model=_str(or_data.get("model"), defaults.openrouter.model),
-            ),
-            newapi=ProviderConfig(
-                enabled=_bool(na_data.get("enabled"), defaults.newapi.enabled),
-                api_key=_str(na_data.get("api_key"), defaults.newapi.api_key),
-                base_url=_str(na_data.get("base_url"), defaults.newapi.base_url),
-                model=_str(na_data.get("model"), defaults.newapi.model),
-            ),
+            default_image_config=default_image_config,
+            model_groups=model_groups,
             request=RequestConfig(
                 timeout=max(
                     1.0, _float(rq_data.get("timeout"), defaults.request.timeout)
@@ -188,3 +199,200 @@ class PluginConfig:
                 ),
             ),
         )
+
+
+# ── 模型组解析 ────────────────────────────────────────────
+
+
+def _parse_model_groups(
+    value: Any,
+    default_output: ImageOutputConfig,
+) -> list[ModelGroupConfig]:
+    """解析 template_list 返回的模型组列表。"""
+    if value is None:
+        return []
+    # 兼容 JSON 字符串（降级方案）
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("[gen_img] model_groups JSON 解析失败")
+            return []
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+
+    groups: list[ModelGroupConfig] = []
+    seen_names: set[str] = set()
+
+    for index, item in enumerate(value, start=1):
+        group_data = _as_dict(item)
+        if not group_data:
+            continue
+
+        group_name = _str(group_data.get("group_name"), "").strip()
+        if not group_name:
+            group_name = f"group-{index}"
+            logger.warning(f"[gen_img] 模型组未命名，自动分配: {group_name}")
+
+        if group_name in seen_names:
+            logger.warning(f"[gen_img] 跳过重复的模型组名: {group_name}")
+            continue
+        seen_names.add(group_name)
+
+        support_img2img = _bool(group_data.get("support_img2img"), True)
+        support_txt2img = _bool(group_data.get("support_txt2img"), False)
+
+        # 解析默认操作类型并校验一致性
+        default_op = _str(group_data.get("default_operation"), "img2img").strip()
+        if default_op not in {"img2img", "txt2img"}:
+            default_op = "img2img"
+        if default_op == "img2img" and not support_img2img and support_txt2img:
+            default_op = "txt2img"
+        elif default_op == "txt2img" and not support_txt2img and support_img2img:
+            default_op = "img2img"
+
+        # 解析输出参数覆盖
+        ar_override = _str(group_data.get("aspect_ratio_override"), "inherit").strip()
+        isz_override = _str(group_data.get("image_size_override"), "inherit").strip()
+
+        groups.append(
+            ModelGroupConfig(
+                group_name=group_name,
+                group_description=_str(
+                    group_data.get("group_description"), ""
+                ).strip(),
+                guide=_str(group_data.get("guide"), "").strip(),
+                support_img2img=support_img2img,
+                support_txt2img=support_txt2img,
+                default_operation=default_op,
+                output_config=ImageOutputConfig(
+                    aspect_ratio=(
+                        default_output.aspect_ratio
+                        if ar_override == "inherit"
+                        else ar_override
+                    ),
+                    image_size=(
+                        default_output.image_size
+                        if isz_override == "inherit"
+                        else isz_override
+                    ),
+                ),
+                endpoints=_parse_endpoints(group_data.get("endpoints", [])),
+            )
+        )
+
+    return groups
+
+
+def _parse_endpoints(value: Any) -> list[EndpointConfig]:
+    """解析端点列表，兼容 template_list 返回的 list[dict] 和 JSON 字符串。"""
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("[gen_img] endpoints JSON 解析失败")
+            return []
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+
+    endpoints: list[EndpointConfig] = []
+    seen_names: set[str] = set()
+
+    for index, item in enumerate(value, start=1):
+        ep_data = _as_dict(item)
+        if not ep_data:
+            continue
+
+        ep_name = _str(ep_data.get("name"), "").strip()
+        if not ep_name:
+            ep_name = f"endpoint-{index}"
+
+        if ep_name in seen_names:
+            logger.warning(f"[gen_img] 跳过重复的端点名: {ep_name}")
+            continue
+        seen_names.add(ep_name)
+
+        endpoints.append(
+            EndpointConfig(
+                name=ep_name,
+                enabled=_bool(ep_data.get("enabled"), True),
+                api_key=_str(ep_data.get("api_key"), ""),
+                base_url=_str(ep_data.get("base_url"), ""),
+                model=_str(ep_data.get("model"), ""),
+            )
+        )
+
+    return endpoints
+
+
+# ── 旧配置迁移 ────────────────────────────────────────────
+
+
+def _migrate_legacy_config(
+    data: Any,
+    default_output: ImageOutputConfig,
+) -> list[ModelGroupConfig]:
+    """将旧的 openrouter/newapi 双槽位配置迁移为单个默认模型组。"""
+    legacy_defaults = {
+        "openrouter": EndpointConfig(
+            name="openrouter",
+            enabled=True,
+            base_url="https://openrouter.ai/api/v1/chat/completions",
+            model="google/gemini-3.1-flash-image-preview",
+        ),
+        "newapi": EndpointConfig(name="newapi", enabled=False),
+    }
+
+    # 检测是否存在旧配置字段
+    has_legacy = False
+    for key in legacy_defaults:
+        if _get(data, key, None) is not None:
+            has_legacy = True
+            break
+    if not has_legacy:
+        return []
+
+    endpoints: list[EndpointConfig] = []
+    for key, default_ep in legacy_defaults.items():
+        raw = _get(data, key, None)
+        if raw is None:
+            continue
+        ep_data = _as_dict(raw)
+        endpoints.append(
+            EndpointConfig(
+                name=default_ep.name,
+                enabled=_bool(ep_data.get("enabled"), default_ep.enabled),
+                api_key=_str(ep_data.get("api_key"), default_ep.api_key),
+                base_url=_str(ep_data.get("base_url"), default_ep.base_url),
+                model=_str(ep_data.get("model"), default_ep.model),
+            )
+        )
+
+    if not endpoints:
+        return []
+
+    logger.info("[gen_img] 检测到旧配置格式，已自动迁移为默认模型组")
+    return [
+        ModelGroupConfig(
+            group_name="default",
+            group_description="默认图片生成模型组（从旧配置迁移）",
+            support_img2img=True,
+            support_txt2img=False,
+            default_operation="img2img",
+            output_config=ImageOutputConfig(
+                aspect_ratio=default_output.aspect_ratio,
+                image_size=default_output.image_size,
+            ),
+            endpoints=endpoints,
+        )
+    ]
