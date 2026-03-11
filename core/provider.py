@@ -38,6 +38,15 @@ _RETRYABLE_STATUS = {408, 500, 502, 503, 504}
 _NO_RETRY_STATUS = {400, 401, 403, 404, 422}
 
 
+def _is_json(text: str) -> bool:
+    """快速判断字符串是否为有效 JSON（用于文本清理决策）。"""
+    try:
+        json.loads(text)
+        return True
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+
 @dataclass
 class ProviderResult:
     images: list[tuple[str, str]] = field(default_factory=list)
@@ -57,12 +66,14 @@ class OpenAICompatibleProvider:
         config: EndpointConfig,
         session: aiohttp.ClientSession,
         request_config: RequestConfig,
+        modalities: list[str] | tuple[str, ...],
         output_config: ImageOutputConfig,
     ) -> None:
         self.name = name
         self.config = config
         self.session = session
         self.request_config = request_config
+        self.modalities = list(modalities) or ["image", "text"]
         self.output_config = output_config
 
     async def generate(
@@ -126,7 +137,7 @@ class OpenAICompatibleProvider:
         payload: dict[str, Any] = {
             "model": self.config.model,
             "messages": [{"role": "user", "content": content}],
-            "modalities": ["image", "text"],
+            "modalities": list(self.modalities),
             "stream": False,
         }
         # 添加 image_config（部分 OpenAI 兼容端点可能忽略此字段）
@@ -197,16 +208,54 @@ class OpenAICompatibleProvider:
     # ── 响应解析 ──────────────────────────────────────────
 
     async def _parse_response(self, data: dict, status: int) -> ProviderResult:
-        """解析 Chat Completions 响应，提取图片。"""
+        """解析 Chat Completions 响应，提取图片。
+
+        兼容两种顶层格式：
+        - Chat Completions: {choices: [{message: {content: ...}}]}
+        - Images Generations: {data: [{url: ...} | {b64_json: ...}]}
+        """
         images: list[tuple[str, str]] = []
         texts: list[str] = []
         download_failed = False
         seen: set[str] = set()  # 候选去重
 
+        # ── 顶层 data[] 格式（/v1/images/generations 风格）──
+        top_data = data.get("data")
+        if isinstance(top_data, list) and top_data:
+            for item in top_data:
+                if not isinstance(item, dict):
+                    continue
+                # url 格式
+                url = item.get("url", "")
+                if isinstance(url, str) and url:
+                    failed = await self._consume_candidate(url, images)
+                    download_failed = download_failed or failed
+                # b64_json 格式
+                b64 = item.get("b64_json") or item.get("base64")
+                if isinstance(b64, str) and b64:
+                    mime = str(item.get("mime_type") or item.get("mime") or "image/png")
+                    self._try_append_b64(mime, b64, images)
+                # revised_prompt 作为文本
+                rp = item.get("revised_prompt")
+                if isinstance(rp, str) and rp.strip():
+                    texts.append(rp.strip())
+            if images:
+                return ProviderResult(
+                    images=images, text="\n".join(texts).strip(), status_code=status
+                )
+            if download_failed:
+                return ProviderResult(
+                    text="\n".join(texts).strip(),
+                    error=f"{self.name} data[] 中的图片 URL 下载失败",
+                    status_code=status,
+                    should_fallback=True,
+                )
+
+        # ── Chat Completions 格式 ──
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             return ProviderResult(
-                error=f"{self.name} 响应中无 choices",
+                error=f"{self.name} 响应中无 choices 或 data",
                 status_code=status,
                 should_fallback=True,
             )
@@ -241,11 +290,16 @@ class OpenAICompatibleProvider:
             if isinstance(content, str):
                 failed = await self._extract_from_text(content, images, seen)
                 download_failed = download_failed or failed
-                # 清理 text：去掉 markdown 图片标记和裸 data URI
+                # 清理 text：去掉图片相关内容
                 clean = _MD_IMG_RE.sub("", content)
-                clean = _DATA_URI_RE.sub("", clean).strip()
-                if clean:
-                    texts.append(clean)
+                clean = _DATA_URI_RE.sub("", clean)
+                # 如果整段 content 是 JSON 或裸 URL（图片载体），不保留为文本
+                stripped = clean.strip()
+                if stripped and not (
+                    (stripped[0] in "[{" and _is_json(stripped))
+                    or _HTTP_RE.match(stripped)
+                ):
+                    texts.append(stripped)
 
             # ── 情况 2：content 是结构化列表 ──
             elif isinstance(content, list):
@@ -265,7 +319,12 @@ class OpenAICompatibleProvider:
 
                     elif ptype == "image_url":
                         img_url = part.get("image_url", {})
-                        url = img_url.get("url", "") if isinstance(img_url, dict) else ""
+                        if isinstance(img_url, dict):
+                            url = img_url.get("url", "")
+                        elif isinstance(img_url, str):
+                            url = img_url
+                        else:
+                            url = ""
                         if url:
                             failed = await self._consume_candidate(url, images)
                             download_failed = download_failed or failed
@@ -296,8 +355,12 @@ class OpenAICompatibleProvider:
     async def _extract_from_text(
         self, text: str, images: list[tuple[str, str]], seen: set[str]
     ) -> bool:
-        """从文本中提取 data URI 和 markdown 图片链接，返回是否有下载失败。"""
+        """从文本中提取图片，返回是否有下载失败。
+
+        按优先级处理：markdown 图片 → data URI → JSON 字符串 → 裸 HTTP URL。
+        """
         download_failed = False
+
         # markdown 图片标记（可能包含 data URI 或 HTTP URL）
         for match in _MD_IMG_RE.finditer(text):
             candidate = match.group(1).strip().strip("<>")
@@ -305,6 +368,7 @@ class OpenAICompatibleProvider:
                 seen.add(candidate)
                 failed = await self._consume_candidate(candidate, images)
                 download_failed = download_failed or failed
+
         # 非 markdown 包裹的 data URI（避免与上面重复）
         for match in _DATA_URI_RE.finditer(text):
             full_uri = match.group(0)
@@ -314,6 +378,37 @@ class OpenAICompatibleProvider:
             mime = match.group(1)
             b64 = re.sub(r"\s+", "", match.group(2))
             self._try_append_b64(mime, b64, images)
+
+        # JSON 字符串格式：content 可能是 JSON 编码的 {url:...} 或 [{url:...}]
+        stripped = text.strip()
+        if not images and stripped and stripped[0] in "[{":
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                pass
+            else:
+                items = parsed if isinstance(parsed, list) else [parsed]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    url = item.get("url", "")
+                    if isinstance(url, str) and url and url not in seen:
+                        seen.add(url)
+                        failed = await self._consume_candidate(url, images)
+                        download_failed = download_failed or failed
+                    b64 = item.get("b64_json") or item.get("base64")
+                    if isinstance(b64, str) and b64:
+                        mime = str(item.get("mime_type") or item.get("mime") or "image/png")
+                        self._try_append_b64(mime, b64, images)
+
+        # 裸 HTTP URL（整段 content 就是一个 URL，没有 markdown 包裹）
+        if not images and _HTTP_RE.match(stripped):
+            candidate = stripped.split()[0]  # 取第一个 token 防止尾随文字
+            if candidate not in seen:
+                seen.add(candidate)
+                failed = await self._consume_candidate(candidate, images)
+                download_failed = download_failed or failed
+
         return download_failed
 
     async def _consume_candidate(

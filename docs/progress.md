@@ -1,6 +1,6 @@
 # astrbot_plugin_gen_img — 开发进度
 
-> 最后更新：2026-03-11 09:43
+> 最后更新：2026-03-11 23:54
 
 ## 项目概况
 
@@ -55,6 +55,13 @@ astrbot_plugin_gen_img/
 - `core/config.py`：新增 `_auto_endpoint_name` 和 `_parse_endpoints_text` 函数，`_parse_endpoints` 改为先判断 JSON 再 fallback 多行文本，旧 `list[dict]` 路径保持兼容
 - `README.md`：端点配置说明从表格改为多行文本格式说明
 
+### modalities 配置化 + 响应解析增强
+- `_conf_schema.json`：模型组新增 `modalities` 字段（string，默认 `image,text`），纯出图模型设为 `image`
+- `core/config.py`：新增 `_DEFAULT_MODALITIES` 常量、`_str_list()` 辅助函数（支持逗号分隔/JSON 数组/中文逗号），`ModelGroupConfig` 新增 `modalities` 字段，`_parse_model_groups` 解析 modalities
+- `core/provider.py`：`__init__` 新增 `modalities` 参数，`_build_payload` 使用配置值替代硬编码 `["image","text"]`；`_parse_response` 新增顶层 `data[]` 格式解析（兼容 `/v1/images/generations` 风格）；`_extract_from_text` 新增 JSON 字符串和裸 HTTP URL 解析；`image_url` 兼容字符串值；文本清理覆盖新格式（`_is_json` 辅助函数）
+- `main.py`：传递 `group_cfg.modalities` 给 provider
+- `README.md`：模型组表格新增 `modalities` 字段说明
+
 ### 基础设施（v0.1.0）
 - 图片提取（`core/image_extract.py`）：本地路径/URL/data URI 统一解析，MIME 魔数检测，GIF 转 PNG，大小校验
 - 提供商请求（`core/provider.py`）：四层响应解析（images[] / markdown data URI / markdown URL / 结构化 content part），输出图下载限制 50MB
@@ -73,13 +80,15 @@ astrbot_plugin_gen_img/
 | 火山引擎走 OpenAI Chat Completions 兼容 | 无需特殊适配器，配置 base_url 和 model 即可接入 |
 | Agent 主动传入图片路径 + fallback 消息提取 | 支持多轮对话 + 兼容单轮简单场景 |
 | 401/403/404 也触发降级 | 两端点 key/model 可能不同，一个失败不代表另一个也失败 |
+| modalities 模型组级配置 | SeedDream 等 image-only 模型需要 `["image"]`，Gemini 等需要 `["image","text"]`，不可硬编码 |
+| 响应解析兼容 data[] 格式 | NewAPI 中转可能返回 `/v1/images/generations` 风格响应，需兼容顶层 `data[{url/b64_json}]` |
 
 ## 待完成
 
-- [ ] 端到端联调测试：配置模型组和端点后在 AstrBot 中验证完整流程
+- [ ] 端到端联调：SeedDream 模型组设置 `modalities: image` 后重新验证（OpenRouter + NewAPI）
 - [x] ~~验证嵌套 template_list 在 AstrBot WebUI 中的渲染效果~~ → 已确认不支持，改为多行文本方案
-- [ ] txt2img 联调：验证 images=[] 时 Chat Completions 请求是否正常返回图片
-- [ ] NewAPI 中转联调：验证 `image_config` 在 NewAPI 上的行为
+- [x] ~~modalities 硬编码导致 image-only 模型 404~~ → 已改为模型组级配置
+- [ ] NewAPI 中转联调：确认 SeedDream 响应格式是否被 data[] / 裸 URL 解析覆盖
 - [ ] 考虑 Pillow 是否需要加入 `requirements.txt`
 - [ ] 本地路径读取安全性：考虑目录白名单
 - [ ] 日志脱敏：评估路径/URL 前缀脱敏需求
@@ -128,3 +137,8 @@ Tool 返回确认文本 → Agent 继续文字回复
 本轮完成：确认 AstrBot WebUI 不支持嵌套 template_list 渲染，将 endpoints 从嵌套 template_list 改为多行文本方案（每行 `名称|地址|密钥|模型`）。涉及 3 文件：_conf_schema.json、core/config.py、README.md。Codex review 无 critical 问题
 主体更新：技术栈、目录结构、已完成（v0.2.0 描述修正 + 新增端点配置文本化区块）、关键决策、待完成
 下一步：端到端联调测试
+
+### 2026-03-11 23:54
+本轮完成：首次端到端联调 SeedDream 4.5，发现并修复两个问题——modalities 硬编码导致 OpenRouter 404、响应解析不覆盖 data[]/裸 URL/JSON 字符串格式。涉及 5 文件，Codex review 无 critical
+主体更新：已完成（新增 modalities + 响应解析区块）、关键决策（+2）、待完成
+下一步：SeedDream 模型组设 `modalities: image` 后重新联调验证

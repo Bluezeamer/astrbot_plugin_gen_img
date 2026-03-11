@@ -74,6 +74,7 @@ class Main(Star):
                         config=ep,
                         session=self.session,
                         request_config=self.config.request,
+                        modalities=group_cfg.modalities,
                         output_config=group_cfg.output_config,
                     )
                 )

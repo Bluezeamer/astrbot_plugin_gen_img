@@ -50,6 +50,7 @@ git clone <repo_url> astrbot_plugin_gen_img
 | `support_img2img` | 是否支持图生图 |
 | `support_txt2img` | 是否支持文生图 |
 | `default_operation` | Agent 未指定 operation 时的默认值 |
+| `modalities` | 输出模态，逗号分隔。默认 `image,text`；纯出图模型（如 SeedDream、FLUX）设为 `image` |
 | `aspect_ratio_override` | 宽高比覆盖，`inherit` 表示继承全局默认值 |
 | `image_size_override` | 分辨率覆盖，`inherit` 表示继承全局默认值 |
 

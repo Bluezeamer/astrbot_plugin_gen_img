@@ -86,6 +86,12 @@
                         "default": "img2img",
                         "hint": "Agent 未指定 operation 时使用此默认值。"
                     },
+                    "modalities": {
+                        "description": "输出模态",
+                        "type": "string",
+                        "default": "image,text",
+                        "hint": "逗号分隔。默认 image,text（适用于 Gemini 等多模态模型）；纯出图模型（如 SeedDream、FLUX）请填 image。"
+                    },
                     "aspect_ratio_override": {
                         "description": "宽高比覆盖",
                         "type": "string",

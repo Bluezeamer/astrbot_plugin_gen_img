@@ -16,6 +16,7 @@ from astrbot.api import logger
 # ── 类型转换辅助 ──────────────────────────────────────────
 
 _MISSING = object()
+_DEFAULT_MODALITIES = ("image", "text")
 
 
 def _get(data: Any, key: str, default: Any = None) -> Any:
@@ -74,6 +75,29 @@ def _str(value: Any, default: str) -> str:
     return str(value)
 
 
+def _str_list(value: Any, default: tuple[str, ...] | list[str]) -> list[str]:
+    """将逗号分隔字符串、JSON 数组或 list/tuple 转为 list[str]。"""
+    fallback = list(default)
+    if isinstance(value, (list, tuple)):
+        items = [str(item).strip() for item in value if str(item).strip()]
+        return items or fallback
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return fallback
+        # JSON 数组格式（如 '["image"]'）
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return _str_list(parsed, default)
+            except json.JSONDecodeError:
+                pass
+        # 逗号分隔格式，兼容中文逗号
+        return [p.strip() for p in raw.replace("，", ",").split(",") if p.strip()] or fallback
+    return fallback
+
+
 # ── 配置 dataclass ────────────────────────────────────────
 
 
@@ -128,6 +152,7 @@ class ModelGroupConfig:
     support_img2img: bool = True
     support_txt2img: bool = False
     default_operation: str = "img2img"
+    modalities: list[str] = field(default_factory=lambda: list(_DEFAULT_MODALITIES))
     output_config: ImageOutputConfig = field(default_factory=ImageOutputConfig)
     endpoints: list[EndpointConfig] = field(default_factory=list)
 
@@ -270,6 +295,10 @@ def _parse_model_groups(
                 support_img2img=support_img2img,
                 support_txt2img=support_txt2img,
                 default_operation=default_op,
+                modalities=_str_list(
+                    group_data.get("modalities"),
+                    _DEFAULT_MODALITIES,
+                ),
                 output_config=ImageOutputConfig(
                     aspect_ratio=(
                         default_output.aspect_ratio
