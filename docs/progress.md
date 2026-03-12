@@ -1,6 +1,6 @@
 # astrbot_plugin_gen_img — 开发进度
 
-> 最后更新：2026-03-12 06:36
+> 最后更新：2026-03-12 07:11
 
 ## 项目概况
 
@@ -95,6 +95,8 @@ astrbot_plugin_gen_img/
 | 配额"先扣后退"模式 | check→生成→consume 非原子会被并发绕过，改为 try_acquire 原子扣减 + 失败 refund |
 | 配额 date_key 精确回退 | try_acquire 返回 date_key，refund 按此回退，防止跨 reset_hour 边界退错周期 |
 | QuotaManager 初始化失败降级 | SQLite 打不开不应阻塞插件启动，降级为不限额并记录 warning |
+| 工具返回文本注入运行时模型组信息 | 静态 docstring 无法包含动态模型组列表，改为在关键决策点（多组未指定、guide 返回、操作不支持等）动态注入模型组名称/操作类型/描述等信息 |
+| 所有失败路径附加"禁止编造图片"约束 | 防止 Agent 生成失败后幻觉出虚假图片 URL |
 
 ## 待完成
 
@@ -169,3 +171,8 @@ Tool 返回确认文本 + 剩余额度 → Agent 继续文字回复
 本轮完成：工具注册机制从 `FunctionTool` 子类 + `add_llm_tools()` 迁移到 `@llm_tool()` 装饰器方式，修复 AstrBot 插件粒度权限过滤无法识别工具归属的问题。删除 `core/tool.py`，逻辑迁入 `main.py`（4 文件 +253/-394 行）。Codex review 通过
 主体更新：项目概况（注册方式描述）、目录结构（移除 tool.py）、已完成（动态模型组架构/配额系统描述更新）、关键决策（+@llm_tool 迁移）、待完成（+权限控制联调）
 下一步：提交 git + 端到端联调验证插件粒度权限控制
+
+### 2026-03-12 07:11
+本轮完成：增强工具提示词引导，解决 Agent 多模型组盲选、默认 operation 误判、失败后幻觉图片三个实际问题。新增 `_build_groups_overview()`/`_build_group_info()` 辅助方法，优化全部返回路径的提示文本，`None` 参数防御性处理。Codex review 修复条件化输出等问题
+主体更新：关键决策（+2：运行时信息注入、禁止编造约束）
+下一步：部署验证提示词引导效果 + 端到端联调

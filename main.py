@@ -200,6 +200,64 @@ class Main(Star):
 
         return []
 
+    def _build_groups_overview(self) -> str:
+        """构建模型组概览文本，帮助 Agent 选择 model_group 和 operation。"""
+        lines = ["可用模型组（请通过 model_group 参数指定）："]
+
+        for gname, rtg in self.runtime_groups.items():
+            cfg = rtg.config
+            ops: list[str] = []
+            if cfg.support_txt2img:
+                ops.append("txt2img")
+            if cfg.support_img2img:
+                ops.append("img2img")
+            desc = cfg.group_description or "未配置描述"
+            lines.append(
+                f"  - {gname}: {desc} "
+                f"[支持: {', '.join(ops)}; 默认: {cfg.default_operation}]"
+            )
+
+        lines.append("")
+        lines.append("调用说明：")
+        lines.append(
+            "  - 纯文字描述生成图片 → operation=\"txt2img\"（无需 image_urls）"
+        )
+        lines.append(
+            "  - 基于参考图片生成 → operation=\"img2img\""
+            "（优先传 image_urls，未传时尝试读取消息附图）"
+        )
+        lines.append(
+            "  - 不传 operation 时使用该模型组的默认操作，"
+            "请注意默认操作是否符合用户意图"
+        )
+        lines.append(
+            "  - 如果用户没有提供参考图片，应使用支持 txt2img 的模型组"
+        )
+        return "\n".join(lines)
+
+    def _build_group_info(self, group_name: str, cfg: ModelGroupConfig) -> str:
+        """构建单个模型组的操作信息摘要，仅列出实际支持的操作。"""
+        ops: list[str] = []
+        if cfg.support_txt2img:
+            ops.append("txt2img")
+        if cfg.support_img2img:
+            ops.append("img2img")
+        desc = cfg.group_description or "未配置描述"
+        lines = [
+            f"【模型组 '{group_name}' 信息】",
+            f"  - 描述: {desc}",
+            f"  - 支持操作: {', '.join(ops)}",
+            f"  - 默认操作: {cfg.default_operation}",
+        ]
+        if cfg.support_txt2img:
+            lines.append('  - 纯文本生图请传 operation="txt2img"（无需 image_urls）')
+        if cfg.support_img2img:
+            lines.append(
+                "  - 基于参考图生图请传 operation=\"img2img\"，"
+                "优先通过 image_urls 传入图片；未传时会尝试读取消息附图"
+            )
+        return "\n".join(lines)
+
     # ── LLM 工具 ──
 
     @llm_tool(name="gen_img")
@@ -211,12 +269,12 @@ class Main(Star):
         operation: str = "",
         image_urls: list = None,
     ) -> str:
-        '''图片生成工具：基于提示词和可选的参考图片生成新图片。使用流程：1) 传 model_group 不传 prompt 获取该模型组的 prompt 构建指南；2) 根据指南构建 prompt 后再次调用生成图片。多模型组时必须先指定 model_group。调用后工具会直接将图片发送给用户。
+        '''图片生成工具：基于提示词和可选的参考图片生成新图片。调用后工具会直接将图片发送给用户。重要：多模型组时不传 model_group 会返回模型组列表，请根据用户意图选择合适的模型组和 operation（txt2img 或 img2img）。不传 prompt 时返回该模型组的 prompt 构建指南。禁止自行编造图片 URL。
 
         Args:
             model_group(string): 模型组名称，多模型组时必须指定，单模型组时可省略
             prompt(string): 图片生成指令，不传时返回所选模型组的 prompt 构建指南
-            operation(string): 操作类型，img2img 或 txt2img，不传时使用模型组默认操作
+            operation(string): 操作类型，img2img（需参考图）或 txt2img（纯文本），不传时使用模型组默认操作
             image_urls(array[string]): 参考图片的路径或 URL 列表，仅 img2img 模式需要
         '''
         try:
@@ -224,7 +282,11 @@ class Main(Star):
                                           operation, image_urls)
         except Exception as exc:
             logger.error(f"[gen_img] tool 调用异常: {exc}", exc_info=True)
-            return f"图片生成过程中发生内部错误：{exc}"
+            return (
+                f"图片生成过程中发生内部错误：{exc}\n"
+                "禁止自行编造图片 URL 或假装图片已生成，"
+                "请如实告知用户生成失败。"
+            )
 
     async def _do_gen_img(
         self,
@@ -241,39 +303,41 @@ class Main(Star):
         runtime_groups = self.runtime_groups
 
         # ── 第一步：解析 model_group ──
-        group_name = str(model_group).strip()
+        group_name = str(model_group or "").strip()
         if not group_name:
             if len(runtime_groups) == 1:
                 group_name = next(iter(runtime_groups))
             else:
-                available = "、".join(runtime_groups.keys())
-                return (
-                    f"有多个模型组可用，请通过 model_group 参数指定: {available}"
-                )
+                return self._build_groups_overview()
 
         rtg = runtime_groups.get(group_name)
         if rtg is None:
-            available = "、".join(runtime_groups.keys())
-            return f"模型组 '{group_name}' 不存在。可用模型组: {available}"
+            return (
+                f"模型组 '{group_name}' 不存在。\n"
+                f"{self._build_groups_overview()}"
+            )
 
         group_cfg = rtg.config
-        prompt = str(prompt).strip()
+        prompt = str(prompt or "").strip()
 
         # ── 第二步：无 prompt → 返回 guide ──
         if not prompt:
+            group_info = self._build_group_info(group_name, group_cfg)
             if group_cfg.guide:
                 return (
-                    f"【模型组 '{group_name}' 的 prompt 构建指南】\n\n"
-                    f"{group_cfg.guide}\n\n"
-                    "请根据以上指南构建 prompt 后，再次调用本工具并传入 prompt 参数。"
+                    f"{group_info}\n\n"
+                    f"【prompt 构建指南】\n{group_cfg.guide}\n\n"
+                    "请根据以上指南构建 prompt 后，"
+                    "再次调用本工具并传入 prompt 和 operation 参数。"
                 )
             return (
+                f"{group_info}\n\n"
                 f"模型组 '{group_name}' 没有配置 prompt 构建指南，"
-                "请直接传入 prompt 调用。"
+                "请直接传入 prompt 和 operation 调用。"
             )
 
         # ── 第三步：解析 operation 并校验 ──
-        operation = str(operation).strip()
+        operation = str(operation or "").strip()
         if not operation:
             operation = group_cfg.default_operation
 
@@ -285,8 +349,8 @@ class Main(Star):
 
         if operation not in supported_ops:
             return (
-                f"模型组 '{group_name}' 不支持操作 '{operation}'。"
-                f"支持的操作: {', '.join(sorted(supported_ops))}"
+                f"模型组 '{group_name}' 不支持操作 '{operation}'。\n"
+                f"{self._build_group_info(group_name, group_cfg)}"
             )
 
         # ── 第四步：根据 operation 处理图片 ──
@@ -294,9 +358,16 @@ class Main(Star):
         if operation == "img2img":
             images = await self._resolve_images(event, image_urls)
             if not images:
+                hint = ""
+                if group_cfg.support_txt2img:
+                    hint = (
+                        "\n如需从纯文本描述生成图片，请改为 "
+                        'operation="txt2img" 并去掉 image_urls。'
+                    )
                 return (
                     "图生图操作需要参考图片。"
-                    "请通过 image_urls 传入图片路径，或确保消息中附带了图片。"
+                    "请通过 image_urls 传入图片路径，"
+                    f"或确保消息中附带了图片。{hint}"
                 )
         # txt2img: 不提取图片，即使消息中有也忽略
 
@@ -329,7 +400,11 @@ class Main(Star):
             result = await rtg.router.generate(prompt, images)
 
             if result.error or not result.images:
-                return result.error or "图片生成失败，未返回图片结果。"
+                return (
+                    (result.error or "图片生成失败，未返回图片结果。")
+                    + "\n禁止自行编造图片 URL 或假装图片已生成，"
+                    "请如实告知用户生成失败。"
+                )
 
             chain: list = [Comp.Reply(id=event.message_obj.message_id)]
             chain.extend(Comp.Image.fromBase64(b64) for _, b64 in result.images)
