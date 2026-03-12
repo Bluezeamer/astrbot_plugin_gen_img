@@ -169,5 +169,36 @@
                 "default": true
             }
         }
+    },
+    "quota": {
+        "description": "用户配额限制",
+        "type": "object",
+        "hint": "限制每个用户每日的图片生成调用次数。默认关闭。",
+        "items": {
+            "enabled": {
+                "description": "启用配额限制",
+                "type": "bool",
+                "default": false,
+                "hint": "开启后，每个用户每日的图片生成次数将受到 daily_limit 限制。"
+            },
+            "daily_limit": {
+                "description": "每用户每日调用次数上限",
+                "type": "int",
+                "default": 10,
+                "hint": "每个用户在一个配额周期内最多可调用的图片生成次数。"
+            },
+            "reset_hour": {
+                "description": "每日重置时间（0-23，本地时区）",
+                "type": "int",
+                "default": 0,
+                "hint": "配额在每天此时间点重置。例如设为 6 则每天 06:00 重置。"
+            },
+            "whitelist": {
+                "description": "白名单用户 ID",
+                "type": "text",
+                "default": "",
+                "hint": "每行一个用户 ID，白名单内的用户不受配额限制。"
+            }
+        }
     }
 }

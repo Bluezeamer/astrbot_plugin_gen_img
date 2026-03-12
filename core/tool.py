@@ -24,6 +24,7 @@ from pydantic import Field
 from pydantic.dataclasses import dataclass
 
 from .image_extract import extract_image_refs_from_event, resolve_image_refs
+from .quota import QuotaExhausted
 
 if TYPE_CHECKING:
     from ..main import Main
@@ -34,6 +35,7 @@ TOOL_NAME = "gen_img"
 @dataclass
 class GenImgTool(FunctionTool[AstrAgentContext]):
     plugin: Any = None
+    quota_manager: Any = None  # QuotaManager | None，用 Any 避免 Pydantic schema 报错
     name: str = TOOL_NAME
     description: str = ""
     parameters: dict = Field(default_factory=dict)
@@ -236,30 +238,75 @@ class GenImgTool(FunctionTool[AstrAgentContext]):
                 )
         # txt2img: 不提取图片，即使消息中有也忽略
 
+        # ── 配额预扣（所有本地校验通过后、实际生成前）──
+        quota_user_id: str | None = None
+        quota_used = 0
+        quota_limit = 0
+        quota_date_key = ""
+        if self.quota_manager is not None:
+            quota_user_id = str(event.get_sender_id()).strip()
+            try:
+                quota_used, quota_limit, quota_date_key = (
+                    await self.quota_manager.try_acquire(quota_user_id)
+                )
+            except QuotaExhausted as exc:
+                return (
+                    f"你今日的图片生成额度已用完（{exc.used}/{exc.limit} 次）。"
+                    f"配额将在每天 {plugin.config.quota.reset_hour:02d}:00 重置。"
+                )
+
         logger.info(
             f"[gen_img] tool 调用 group={group_name} operation={operation} "
             f"input_images={len(images)} prompt_len={len(prompt)}"
         )
 
-        # ── 第五步：调用路由生成 ──
-        result = await rtg.router.generate(prompt, images)
+        # ── 第五步：调用路由生成并发送 ──
+        # 预扣后的所有操作包在 try/except 中，失败时统一回退配额
+        generation_ok = False
+        try:
+            result = await rtg.router.generate(prompt, images)
 
-        if result.error or not result.images:
-            return result.error or "图片生成失败，未返回图片结果。"
+            if result.error or not result.images:
+                return result.error or "图片生成失败，未返回图片结果。"
 
-        # 构建消息链并发送
-        chain: list = [Comp.Reply(id=event.message_obj.message_id)]
-        chain.extend(Comp.Image.fromBase64(b64) for _, b64 in result.images)
-        if result.text:
-            chain.append(Comp.Plain(result.text))
-        await event.send(MessageChain(chain=chain))
+            # 构建消息链并发送
+            chain: list = [Comp.Reply(id=event.message_obj.message_id)]
+            chain.extend(Comp.Image.fromBase64(b64) for _, b64 in result.images)
+            if result.text:
+                chain.append(Comp.Plain(result.text))
+            await event.send(MessageChain(chain=chain))
+            generation_ok = True
+        finally:
+            if (
+                not generation_ok
+                and self.quota_manager is not None
+                and quota_user_id is not None
+            ):
+                try:
+                    await self.quota_manager.refund(
+                        quota_user_id, quota_date_key
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"[gen_img] 配额回退失败 user={quota_user_id}: {exc}",
+                        exc_info=True,
+                    )
+
+        # 构造配额信息（配额已在 try_acquire 中预扣）
+        quota_note = ""
+        if self.quota_manager is not None and quota_user_id is not None:
+            if quota_limit < 0:
+                quota_note = "（白名单用户，不受配额限制）"
+            else:
+                remaining = max(quota_limit - quota_used, 0)
+                quota_note = f"（今日剩余额度: {remaining}/{quota_limit}）"
 
         detail = f"（模型组: {group_name}"
         if result.provider_used:
             detail += f", 提供商: {result.provider_used}"
         detail += "）"
         return (
-            f"图片生成完成，已发送给用户{detail}。"
+            f"图片生成完成，已发送给用户{detail}。{quota_note}"
             "请直接继续回复用户，禁止再次调用 gen_img。"
         )
 

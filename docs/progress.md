@@ -1,6 +1,6 @@
 # astrbot_plugin_gen_img — 开发进度
 
-> 最后更新：2026-03-11 23:54
+> 最后更新：2026-03-12 01:54
 
 ## 项目概况
 
@@ -17,6 +17,7 @@ AstrBot 插件，通过 LLM FunctionTool 机制注册图片生成工具（`gen_i
 - **图片处理**：Pillow（可选，用于 GIF 转 PNG）
 - **API 协议**：OpenAI Chat Completions 兼容（支持 OpenRouter、NewAPI、火山引擎等）
 - **配置系统**：AstrBot `template_list`（模型组层）+ 多行文本（端点层）
+- **配额存储**：sqlite3（Python 标准库，零额外依赖）
 
 ## 目录结构
 
@@ -30,8 +31,9 @@ astrbot_plugin_gen_img/
 ├── .gitignore               # 忽略参考插件、__pycache__、temp
 ├── core/
 │   ├── __init__.py
-│   ├── config.py            # 配置 dataclass（PluginConfig, EndpointConfig, ModelGroupConfig 等）+ 旧配置迁移
-│   ├── tool.py              # FunctionTool 定义（GenImgTool），动态元数据 + 两阶段调用
+│   ├── config.py            # 配置 dataclass（PluginConfig, EndpointConfig, ModelGroupConfig, QuotaConfig 等）+ 旧配置迁移
+│   ├── quota.py             # 用户配额管理：SQLite + threading.Lock，先扣后退模式
+│   ├── tool.py              # FunctionTool 定义（GenImgTool），动态元数据 + 两阶段调用 + 配额检查
 │   ├── image_extract.py     # 图片解析：本地路径/URL/data URI → (mime, base64)
 │   ├── provider.py          # OpenAI 兼容请求构造 + 多格式响应解析
 │   └── router.py            # 端点路由：重试 + 降级调度
@@ -62,6 +64,14 @@ astrbot_plugin_gen_img/
 - `main.py`：传递 `group_cfg.modalities` 给 provider
 - `README.md`：模型组表格新增 `modalities` 字段说明
 
+### 用户配额系统
+- `core/quota.py`（新建）：`QuotaManager` 类，SQLite 单表 `usage(user_id, date_key, count)`，`threading.Lock` 串行化，异步接口 `asyncio.to_thread`。采用"先扣后退"模式（`try_acquire` 原子检查+扣减 → `refund` 按 date_key 精确回退），防止并发绕过。`QuotaExhausted` 异常携带 used/limit。`_ensure_open()` 保证关闭后安全拒绝请求
+- `core/config.py`：新增 `QuotaConfig` dataclass（enabled/daily_limit/reset_hour/whitelist）、`_str_set_lines()` 多行文本→set 辅助函数、`PluginConfig.quota` 字段、`from_dict` 解析 quota 配置
+- `_conf_schema.json`：新增 `quota` 配置区块（object 类型，含 enabled/daily_limit/reset_hour/whitelist 四项）
+- `main.py`：`initialize()` 中按 `quota.enabled` 创建 `QuotaManager`（try/except 降级），传给 `GenImgTool`；`terminate()` 中关闭。数据库路径 `StarTools.get_data_dir() / "quota.sqlite3"`
+- `core/tool.py`：`quota_manager` 字段（Any 类型避免 Pydantic schema 报错），`_do_call()` 中图片校验后、生成前调用 `try_acquire`，整个生成+发送流程包在 `try/finally` 中统一 refund。成功时返回剩余额度信息
+- `README.md`：新增"用户配额（quota）"配置说明文档
+
 ### 基础设施（v0.1.0）
 - 图片提取（`core/image_extract.py`）：本地路径/URL/data URI 统一解析，MIME 魔数检测，GIF 转 PNG，大小校验
 - 提供商请求（`core/provider.py`）：四层响应解析（images[] / markdown data URI / markdown URL / 结构化 content part），输出图下载限制 50MB
@@ -82,6 +92,10 @@ astrbot_plugin_gen_img/
 | 401/403/404 也触发降级 | 两端点 key/model 可能不同，一个失败不代表另一个也失败 |
 | modalities 模型组级配置 | SeedDream 等 image-only 模型需要 `["image"]`，Gemini 等需要 `["image","text"]`，不可硬编码 |
 | 响应解析兼容 data[] 格式 | NewAPI 中转可能返回 `/v1/images/generations` 风格响应，需兼容顶层 `data[{url/b64_json}]` |
+| 配额"先扣后退"模式 | check→生成→consume 非原子会被并发绕过，改为 try_acquire 原子扣减 + 失败 refund |
+| 配额 date_key 精确回退 | try_acquire 返回 date_key，refund 按此回退，防止跨 reset_hour 边界退错周期 |
+| QuotaManager 初始化失败降级 | SQLite 打不开不应阻塞插件启动，降级为不限额并记录 warning |
+| quota_manager 字段用 Any 类型 | GenImgTool 是 pydantic.dataclasses，自定义类型会触发 PydanticSchemaGenerationError |
 
 ## 待完成
 
@@ -92,6 +106,7 @@ astrbot_plugin_gen_img/
 - [ ] 考虑 Pillow 是否需要加入 `requirements.txt`
 - [ ] 本地路径读取安全性：考虑目录白名单
 - [ ] 日志脱敏：评估路径/URL 前缀脱敏需求
+- [ ] 配额功能端到端联调验证
 
 ## 架构速查
 
@@ -111,6 +126,8 @@ AstrBot LLM Agent 推理
 ┌─ img2img ──→ resolve_image_refs() ──→ [(mime, b64), ...]
 └─ txt2img ──→ images = []（跳过图片提取）
     ↓
+quota_manager.try_acquire(user_id) ──→ 配额不足？返回错误文本
+    ↓（配额已预扣）
 RuntimeModelGroup.router.generate()
     ↓
 ┌─ endpoint 1 (主) ──→ 成功？返回
@@ -118,7 +135,8 @@ RuntimeModelGroup.router.generate()
                                     └─ 全部失败 → 错误文本
     ↓
 event.send(MessageChain) → 直接发图给用户
-Tool 返回确认文本 → Agent 继续文字回复
+    ↓（失败则 quota_manager.refund(user_id, date_key)）
+Tool 返回确认文本 + 剩余额度 → Agent 继续文字回复
 ```
 
 ## Changelog
@@ -142,3 +160,8 @@ Tool 返回确认文本 → Agent 继续文字回复
 本轮完成：首次端到端联调 SeedDream 4.5，发现并修复两个问题——modalities 硬编码导致 OpenRouter 404、响应解析不覆盖 data[]/裸 URL/JSON 字符串格式。涉及 5 文件，Codex review 无 critical
 主体更新：已完成（新增 modalities + 响应解析区块）、关键决策（+2）、待完成
 下一步：SeedDream 模型组设 `modalities: image` 后重新联调验证
+
+### 2026-03-12 01:54
+本轮完成：实现用户配额系统，新建 `core/quota.py` + 修改 5 文件 +180 行。SQLite "先扣后退"模式，Codex 三轮 review 修复全部 critical/warning（Pydantic 类型、并发绕过、date_key 跨日、异常路径漏退、初始化降级）
+主体更新：技术栈（+配额存储）、目录结构（+quota.py）、已完成（+用户配额系统）、关键决策（+4）、待完成（+配额联调）、架构速查（+配额环节）
+下一步：提交 git + 配额功能端到端联调验证

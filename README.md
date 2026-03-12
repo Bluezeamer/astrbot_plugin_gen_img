@@ -100,6 +100,19 @@ newapi | https://your-newapi.com/v1/chat/completions | sk-yyy | gemini-image
 | `image.max_input_mb` | 单张图片大小限制（MB） | `20` |
 | `image.allow_reply_image` | 是否读取引用消息中的图片 | `true` |
 
+### 用户配额（quota）
+
+限制每个用户每日的图片生成调用次数，防止滥用导致账单失控。**默认关闭**。
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `quota.enabled` | 是否启用配额限制 | `false` |
+| `quota.daily_limit` | 每用户每日调用次数上限 | `10` |
+| `quota.reset_hour` | 每日重置时间（0-23，本地时区） | `0` |
+| `quota.whitelist` | 白名单用户 ID（多行文本，每行一个） | 空 |
+
+配额基于用户 ID 计数，白名单用户不受限制但仍会记录调用次数。获取 guide（不传 prompt）不消耗配额。配额数据存储在插件数据目录下的 `quota.sqlite3` 文件中。
+
 ## 降级策略
 
 每个模型组内的端点按配置顺序依次尝试。端点内部支持重试，跨端点支持自动降级：

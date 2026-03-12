@@ -7,6 +7,7 @@ Agent 推理后调用，插件负责按模型组路由到具体端点。
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import aiohttp
 from astrbot.api import logger
@@ -15,6 +16,7 @@ from astrbot.core import AstrBotConfig
 
 from .core.config import ModelGroupConfig, PluginConfig
 from .core.provider import OpenAICompatibleProvider
+from .core.quota import QuotaManager
 from .core.router import ProviderRouter
 from .core.tool import TOOL_NAME, GenImgTool
 
@@ -36,6 +38,7 @@ class Main(Star):
         self.session: aiohttp.ClientSession | None = None
         self.runtime_groups: dict[str, RuntimeModelGroup] = {}
         self._tool: GenImgTool | None = None
+        self.quota_manager: QuotaManager | None = None
 
     async def initialize(self):
         """异步初始化：创建 HTTP 会话、装配模型组、注册 LLM 工具。"""
@@ -45,6 +48,33 @@ class Main(Star):
         )
 
         self.runtime_groups = {}
+
+        # 初始化配额管理器
+        if self.config.quota.enabled:
+            try:
+                quota_db = (
+                    Path(StarTools.get_data_dir("astrbot_plugin_gen_img"))
+                    / "quota.sqlite3"
+                )
+                self.quota_manager = QuotaManager(
+                    db_path=quota_db,
+                    daily_limit=self.config.quota.daily_limit,
+                    reset_hour=self.config.quota.reset_hour,
+                    whitelist=self.config.quota.whitelist,
+                )
+                logger.info(
+                    f"[gen_img] 用户配额已启用: "
+                    f"limit={self.config.quota.daily_limit}, "
+                    f"reset={self.config.quota.reset_hour:02d}:00"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[gen_img] 配额管理器初始化失败，已禁用配额功能: {exc}",
+                    exc_info=True,
+                )
+                self.quota_manager = None
+        else:
+            self.quota_manager = None
 
         for group_cfg in self.config.model_groups:
             group_name = group_cfg.group_name
@@ -95,7 +125,7 @@ class Main(Star):
 
         # 仅在有可用模型组时注册 LLM 工具
         if self.runtime_groups:
-            self._tool = GenImgTool(plugin=self)
+            self._tool = GenImgTool(plugin=self, quota_manager=self.quota_manager)
             self.context.add_llm_tools(self._tool)
 
             names = ", ".join(self.runtime_groups.keys())
@@ -106,6 +136,11 @@ class Main(Star):
 
     async def terminate(self):
         """插件卸载：关闭 HTTP 会话、注销 LLM 工具。"""
+        if self.quota_manager is not None:
+            self.quota_manager.close()
+            self.quota_manager = None
+            logger.info("[gen_img] 配额管理器已关闭")
+
         if self.session is not None and not self.session.closed:
             await self.session.close()
             logger.info("[gen_img] HTTP 会话已关闭")

@@ -98,6 +98,19 @@ def _str_list(value: Any, default: tuple[str, ...] | list[str]) -> list[str]:
     return fallback
 
 
+def _str_set_lines(value: Any) -> set[str]:
+    """将多行文本或序列转为去重的 set[str]，每行一个元素。"""
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return {str(item).strip() for item in value if str(item).strip()}
+    if isinstance(value, str):
+        return {
+            line.strip()
+            for line in value.splitlines()
+            if line.strip()
+        }
+    return set()
+
+
 # ── 配置 dataclass ────────────────────────────────────────
 
 
@@ -123,6 +136,16 @@ class ImageConfig:
     max_input_images: int = 3
     max_input_mb: int = 20
     allow_reply_image: bool = True
+
+
+@dataclass
+class QuotaConfig:
+    """用户配额配置。"""
+
+    enabled: bool = False
+    daily_limit: int = 10
+    reset_hour: int = 0
+    whitelist: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -164,6 +187,7 @@ class PluginConfig:
     model_groups: list[ModelGroupConfig] = field(default_factory=list)
     request: RequestConfig = field(default_factory=RequestConfig)
     image: ImageConfig = field(default_factory=ImageConfig)
+    quota: QuotaConfig = field(default_factory=QuotaConfig)
 
     @classmethod
     def from_dict(cls, data: Any) -> PluginConfig:
@@ -173,6 +197,7 @@ class PluginConfig:
         ic_data = _as_dict(_get(data, "default_image_config", {}))
         rq_data = _as_dict(_get(data, "request", {}))
         im_data = _as_dict(_get(data, "image", {}))
+        qt_data = _as_dict(_get(data, "quota", {}))
 
         default_image_config = ImageOutputConfig(
             aspect_ratio=_str(
@@ -222,6 +247,21 @@ class PluginConfig:
                     im_data.get("allow_reply_image"),
                     defaults.image.allow_reply_image,
                 ),
+            ),
+            quota=QuotaConfig(
+                enabled=_bool(qt_data.get("enabled"), defaults.quota.enabled),
+                daily_limit=max(
+                    1,
+                    _int(qt_data.get("daily_limit"), defaults.quota.daily_limit),
+                ),
+                reset_hour=min(
+                    23,
+                    max(
+                        0,
+                        _int(qt_data.get("reset_hour"), defaults.quota.reset_hour),
+                    ),
+                ),
+                whitelist=_str_set_lines(qt_data.get("whitelist")),
             ),
         )
 
