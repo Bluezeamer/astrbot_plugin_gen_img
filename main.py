@@ -13,7 +13,8 @@ from typing import Any
 import aiohttp
 import astrbot.api.message_components as Comp
 from astrbot.api import llm_tool, logger
-from astrbot.api.event import AstrMessageEvent
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core import AstrBotConfig
 from astrbot.core.message.message_event_result import MessageChain
@@ -23,6 +24,13 @@ from .core.image_extract import extract_image_refs_from_event, resolve_image_ref
 from .core.provider import OpenAICompatibleProvider
 from .core.quota import QuotaExhausted, QuotaManager
 from .core.router import ProviderRouter
+
+
+# 系统提示词注入块标记，用于去重检测
+_SYSTEM_HINT_MARKER = "<!-- gen_img_hint -->"
+
+# 模型组描述最大字符数（注入到系统提示词时截断）
+_DESC_MAX_LEN = 50
 
 
 @dataclass
@@ -200,6 +208,52 @@ class Main(Star):
 
         return []
 
+    def _build_system_hint(self) -> str:
+        """构建注入到 system_prompt 的精简模型组提示（供 Agent 决策用）。
+
+        与 _build_groups_overview() 不同：本方法输出更短、面向每轮预注入；
+        _build_groups_overview() 是工具调用失败时的详细兜底文案。
+        """
+        lines: list[str] = [
+            _SYSTEM_HINT_MARKER,
+            "# 图片生成工具 gen_img — 可用模型组",
+            "重要：model_group 名称必须从下列列表原样使用，不要猜测或改写。",
+        ]
+
+        for gname, rtg in self.runtime_groups.items():
+            cfg = rtg.config
+            ops = []
+            if cfg.support_txt2img:
+                ops.append("txt2img")
+            if cfg.support_img2img:
+                ops.append("img2img")
+
+            entry = (
+                f"- {gname} "
+                f"[支持: {', '.join(ops)}; 默认: {cfg.default_operation}]"
+            )
+            # 描述：有内容则截断追加，无则省略
+            desc = " ".join((cfg.group_description or "").split()).strip()
+            if desc:
+                if len(desc) > _DESC_MAX_LEN:
+                    desc = desc[: _DESC_MAX_LEN - 1].rstrip() + "…"
+                entry += f" {desc}"
+            lines.append(entry)
+
+        lines.append(
+            "调用规则："
+            "无参考图 → 优先选择支持 txt2img 的模型组；"
+            "有参考图/基于原图修改 → 优先选择支持 img2img 的模型组。"
+        )
+        lines.append(
+            "如需详细 prompt 写法，可只传 model_group 不传 prompt 以获取该组 guide。"
+        )
+        hint = "\n".join(lines)
+        # 安全阀：极端情况下（模型组很多）截断到 800 字符
+        if len(hint) > 800:
+            hint = hint[:799].rstrip() + "…"
+        return hint
+
     def _build_groups_overview(self) -> str:
         """构建模型组概览文本，帮助 Agent 选择 model_group 和 operation。"""
         lines = ["可用模型组（请通过 model_group 参数指定）："]
@@ -258,6 +312,27 @@ class Main(Star):
             )
         return "\n".join(lines)
 
+    # ── LLM 请求前注入 ──
+
+    @filter.on_llm_request()
+    async def inject_tool_hint(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ):
+        """在 LLM 请求前注入模型组概览，让 Agent 首次调用即可选对模型组。"""
+        if not self.runtime_groups:
+            return
+
+        current = str(req.system_prompt or "")
+        if _SYSTEM_HINT_MARKER in current:
+            return
+
+        hint = self._build_system_hint()
+        req.system_prompt = (
+            f"{current.rstrip()}\n\n{hint}" if current.strip() else hint
+        )
+
     # ── LLM 工具 ──
 
     @llm_tool(name="gen_img")
@@ -269,11 +344,11 @@ class Main(Star):
         operation: str = "",
         image_urls: list = None,
     ) -> str:
-        '''图片生成工具：基于提示词和可选的参考图片生成新图片。调用后工具会直接将图片发送给用户。重要：多模型组时不传 model_group 会返回模型组列表，请根据用户意图选择合适的模型组和 operation（txt2img 或 img2img）。不传 prompt 时返回该模型组的 prompt 构建指南。禁止自行编造图片 URL。
+        '''图片生成工具：基于提示词和可选的参考图片生成新图片。调用后工具会直接将图片发送给用户。请依据系统提示词中的模型组能力选择正确的 model_group，并结合用户是否提供参考图选择 operation（txt2img 或 img2img）。若未传 model_group 或传错，工具会返回可用模型组列表帮助恢复。不传 prompt 时返回所选模型组的 prompt 构建指南。禁止自行编造图片 URL。
 
         Args:
-            model_group(string): 模型组名称，多模型组时必须指定，单模型组时可省略
-            prompt(string): 图片生成指令，不传时返回所选模型组的 prompt 构建指南
+            model_group(string): 优先按系统提示词中的模型组名称原样填写；仅有一个模型组时可省略
+            prompt(string): 图片生成指令，不传时返回所选模型组的 prompt 构建指南（guide）
             operation(string): 操作类型，img2img（需参考图）或 txt2img（纯文本），不传时使用模型组默认操作
             image_urls(array[string]): 参考图片的路径或 URL 列表，仅 img2img 模式需要
         '''

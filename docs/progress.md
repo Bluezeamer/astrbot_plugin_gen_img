@@ -1,10 +1,10 @@
 # astrbot_plugin_gen_img — 开发进度
 
-> 最后更新：2026-03-12 07:11
+> 最后更新：2026-03-12 15:30
 
 ## 项目概况
 
-AstrBot 插件，通过 `@llm_tool()` 装饰器注册图片生成工具（`gen_img`），供 Agent 调用。支持动态模型组配置，每个模型组可挂载多个 OpenAI 兼容端点并按顺序降级路由。支持图生图（img2img）和文生图（txt2img），提供渐进式 guide 加载机制教 Agent 针对不同模型构建最优 prompt。
+AstrBot 插件，通过 `@llm_tool()` 装饰器注册图片生成工具（`gen_img`），供 Agent 调用。支持动态模型组配置，每个模型组可挂载多个 OpenAI 兼容端点并按顺序降级路由。支持图生图（img2img）和文生图（txt2img），通过 `@filter.on_llm_request()` 预注入模型组概览到系统提示词，配合渐进式 guide 加载机制教 Agent 针对不同模型构建最优 prompt。
 
 - 设计文档/计划：`.claude/plans/piped-greeting-seahorse.md`
 - 参考插件（仅本地参考，已 gitignore）：`astrbot_plugin_big_banana/`
@@ -23,7 +23,7 @@ AstrBot 插件，通过 `@llm_tool()` 装饰器注册图片生成工具（`gen_i
 
 ```
 astrbot_plugin_gen_img/
-├── main.py                  # 插件入口：RuntimeModelGroup 装配、@llm_tool 注册、多 router 映射
+├── main.py                  # 插件入口：RuntimeModelGroup 装配、@llm_tool 注册、on_llm_request 系统提示词注入、多 router 映射
 ├── metadata.yaml            # 插件元数据（v0.2.0）
 ├── _conf_schema.json        # AstrBot 管理面板配置 schema（模型组 template_list + 端点多行文本）
 ├── README.md                # 项目说明文档
@@ -71,6 +71,13 @@ astrbot_plugin_gen_img/
 - `main.py`：`gen_img()` 方法中图片校验后、生成前调用 `try_acquire`，整个生成+发送流程包在 `try/finally` 中统一 refund。成功时返回剩余额度信息
 - `README.md`：新增"用户配额（quota）"配置说明文档
 
+### 系统提示词预注入（模型组概览）
+- `main.py`：新增 `_SYSTEM_HINT_MARKER`（HTML 注释标记去重）和 `_DESC_MAX_LEN`（描述截断长度 50 字符）模块常量
+- `main.py`：新增 `_build_system_hint()` 方法，构建精简版模型组提示（≤800 字符安全阀），包含模型组名称/支持操作/默认操作/描述截断/调用规则/guide 获取提示
+- `main.py`：新增 `@filter.on_llm_request()` 钩子 `inject_tool_hint()`，每次 LLM 请求前检查 marker 去重后追加到 `req.system_prompt`
+- `main.py`：更新 `gen_img` docstring，引导 Agent 优先从系统提示词获取模型组信息，保留兜底恢复描述
+- 三层信息传递设计：系统提示词预注入（首轮即可选对）→ 工具兜底返回（错误恢复）→ guide 按需获取（详细 prompt 指南）
+
 ### 基础设施（v0.1.0）
 - 图片提取（`core/image_extract.py`）：本地路径/URL/data URI 统一解析，MIME 魔数检测，GIF 转 PNG，大小校验
 - 提供商请求（`core/provider.py`）：四层响应解析（images[] / markdown data URI / markdown URL / 结构化 content part），输出图下载限制 50MB
@@ -97,6 +104,10 @@ astrbot_plugin_gen_img/
 | QuotaManager 初始化失败降级 | SQLite 打不开不应阻塞插件启动，降级为不限额并记录 warning |
 | 工具返回文本注入运行时模型组信息 | 静态 docstring 无法包含动态模型组列表，改为在关键决策点（多组未指定、guide 返回、操作不支持等）动态注入模型组名称/操作类型/描述等信息 |
 | 所有失败路径附加"禁止编造图片"约束 | 防止 Agent 生成失败后幻觉出虚假图片 URL |
+| `@filter.on_llm_request()` 预注入模型组概览 | Agent 首次调用盲猜模型组名导致额外无效调用，改为系统提示词前置注入精简摘要 |
+| 三层信息传递：预注入 + 兜底 + guide | 预注入解决首轮选择，兜底覆盖错误恢复，guide 保持按需获取避免污染系统提示词 |
+| HTML 注释 marker 去重 | `on_llm_request` 可能多次触发，用固定标记防止重复追加 |
+| 描述截断 50 字符 + 总长 800 字符安全阀 | 防止用户配置过长描述导致系统提示词膨胀 |
 
 ## 待完成
 
@@ -114,7 +125,9 @@ astrbot_plugin_gen_img/
 ```
 用户消息
     ↓
-AstrBot LLM Agent 推理
+@filter.on_llm_request() → inject_tool_hint() 注入模型组概览到 system_prompt
+    ↓
+AstrBot LLM Agent 推理（已知可用模型组列表 + 调用规则）
     ↓
 查看 gen_img @llm_tool description → 了解工具用途
     ↓
@@ -171,6 +184,11 @@ Tool 返回确认文本 + 剩余额度 → Agent 继续文字回复
 本轮完成：工具注册机制从 `FunctionTool` 子类 + `add_llm_tools()` 迁移到 `@llm_tool()` 装饰器方式，修复 AstrBot 插件粒度权限过滤无法识别工具归属的问题。删除 `core/tool.py`，逻辑迁入 `main.py`（4 文件 +253/-394 行）。Codex review 通过
 主体更新：项目概况（注册方式描述）、目录结构（移除 tool.py）、已完成（动态模型组架构/配额系统描述更新）、关键决策（+@llm_tool 迁移）、待完成（+权限控制联调）
 下一步：提交 git + 端到端联调验证插件粒度权限控制
+
+### 2026-03-12 15:30
+本轮完成：通过 `@filter.on_llm_request()` 实现系统提示词预注入模型组概览，解决 Agent 首次调用盲猜模型组名导致额外无效调用的问题。新增 `_build_system_hint()` 精简提示构建 + `inject_tool_hint()` 钩子注入 + marker 去重 + 描述截断/总长安全阀。更新 docstring 引导 Agent 优先从系统提示词获取信息。形成"预注入→兜底→guide"三层信息传递架构。Codex review 无 critical，修复 2 个 warning（措辞过于绝对、总长无上限）
+主体更新：项目概况、目录结构、已完成（+系统提示词预注入区块）、关键决策（+4）、架构速查（+注入环节）
+下一步：部署验证首次调用是否能直接选对模型组
 
 ### 2026-03-12 07:11
 本轮完成：增强工具提示词引导，解决 Agent 多模型组盲选、默认 operation 误判、失败后幻觉图片三个实际问题。新增 `_build_groups_overview()`/`_build_group_info()` 辅助方法，优化全部返回路径的提示文本，`None` 参数防御性处理。Codex review 修复条件化输出等问题
