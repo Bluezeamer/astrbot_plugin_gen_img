@@ -1,10 +1,10 @@
 # astrbot_plugin_gen_img — 开发进度
 
-> 最后更新：2026-03-12 01:54
+> 最后更新：2026-03-12 06:36
 
 ## 项目概况
 
-AstrBot 插件，通过 LLM FunctionTool 机制注册图片生成工具（`gen_img`），供 Agent 调用。支持动态模型组配置，每个模型组可挂载多个 OpenAI 兼容端点并按顺序降级路由。支持图生图（img2img）和文生图（txt2img），提供渐进式 guide 加载机制教 Agent 针对不同模型构建最优 prompt。
+AstrBot 插件，通过 `@llm_tool()` 装饰器注册图片生成工具（`gen_img`），供 Agent 调用。支持动态模型组配置，每个模型组可挂载多个 OpenAI 兼容端点并按顺序降级路由。支持图生图（img2img）和文生图（txt2img），提供渐进式 guide 加载机制教 Agent 针对不同模型构建最优 prompt。
 
 - 设计文档/计划：`.claude/plans/piped-greeting-seahorse.md`
 - 参考插件（仅本地参考，已 gitignore）：`astrbot_plugin_big_banana/`
@@ -23,7 +23,7 @@ AstrBot 插件，通过 LLM FunctionTool 机制注册图片生成工具（`gen_i
 
 ```
 astrbot_plugin_gen_img/
-├── main.py                  # 插件入口：RuntimeModelGroup 装配、多 router 映射、条件工具注册
+├── main.py                  # 插件入口：RuntimeModelGroup 装配、@llm_tool 注册、多 router 映射
 ├── metadata.yaml            # 插件元数据（v0.2.0）
 ├── _conf_schema.json        # AstrBot 管理面板配置 schema（模型组 template_list + 端点多行文本）
 ├── README.md                # 项目说明文档
@@ -33,7 +33,6 @@ astrbot_plugin_gen_img/
 │   ├── __init__.py
 │   ├── config.py            # 配置 dataclass（PluginConfig, EndpointConfig, ModelGroupConfig, QuotaConfig 等）+ 旧配置迁移
 │   ├── quota.py             # 用户配额管理：SQLite + threading.Lock，先扣后退模式
-│   ├── tool.py              # FunctionTool 定义（GenImgTool），动态元数据 + 两阶段调用 + 配额检查
 │   ├── image_extract.py     # 图片解析：本地路径/URL/data URI → (mime, base64)
 │   ├── provider.py          # OpenAI 兼容请求构造 + 多格式响应解析
 │   └── router.py            # 端点路由：重试 + 降级调度
@@ -47,8 +46,8 @@ astrbot_plugin_gen_img/
 - `_conf_schema.json`：从固定 `openrouter`/`newapi` 双槽位改为 `model_groups`（template_list），模板 `openai_compatible` 含 group_name/group_description/guide/support_img2img/support_txt2img/default_operation/aspect_ratio_override/image_size_override，`endpoints` 为多行文本（`type: "text"`）
 - `core/config.py`：`ProviderConfig` → `EndpointConfig`（新增 name 字段），新增 `ModelGroupConfig`，`PluginConfig` 移除 openrouter/newapi 改为 `model_groups: list[ModelGroupConfig]`，新增 `_parse_model_groups`/`_parse_endpoints`/`_migrate_legacy_config`，`from_dict` 用 `_MISSING` 哨兵区分"字段不存在"和"字段为空"
 - `core/provider.py`：构造函数签名 `ProviderConfig` → `EndpointConfig`，移除未使用的 `image_config` 参数
-- `main.py`：新增 `RuntimeModelGroup` dataclass，`self.router` → `self.runtime_groups: dict[str, RuntimeModelGroup]`，遍历 model_groups 构建多 router，provider name 格式 `{group_name}/{ep_name}`，有可用模型组才注册 Tool
-- `core/tool.py`：`_rebuild_metadata()` 在 `__post_init__` 中动态生成 description 和 parameters，两阶段调用（无 prompt → 返回 guide，有 prompt → 执行生成），operation 校验与模型组能力对齐，`_resolve_images` 独立方法并过滤非字符串元素
+- `main.py`：新增 `RuntimeModelGroup` dataclass，`self.router` → `self.runtime_groups: dict[str, RuntimeModelGroup]`，遍历 model_groups 构建多 router，provider name 格式 `{group_name}/{ep_name}`
+- 工具通过 `@llm_tool(name="gen_img")` 装饰器注册（取代旧的 `FunctionTool` 子类 + `add_llm_tools()`），支持插件粒度权限控制。两阶段调用（无 prompt → 返回 guide，有 prompt → 执行生成）、operation 校验、`_resolve_images` 图片解析、配额检查均在 `main.py` 内实现
 - `metadata.yaml`：版本 0.1.0 → 0.2.0
 - `README.md`：完整更新适配新架构
 
@@ -68,8 +67,8 @@ astrbot_plugin_gen_img/
 - `core/quota.py`（新建）：`QuotaManager` 类，SQLite 单表 `usage(user_id, date_key, count)`，`threading.Lock` 串行化，异步接口 `asyncio.to_thread`。采用"先扣后退"模式（`try_acquire` 原子检查+扣减 → `refund` 按 date_key 精确回退），防止并发绕过。`QuotaExhausted` 异常携带 used/limit。`_ensure_open()` 保证关闭后安全拒绝请求
 - `core/config.py`：新增 `QuotaConfig` dataclass（enabled/daily_limit/reset_hour/whitelist）、`_str_set_lines()` 多行文本→set 辅助函数、`PluginConfig.quota` 字段、`from_dict` 解析 quota 配置
 - `_conf_schema.json`：新增 `quota` 配置区块（object 类型，含 enabled/daily_limit/reset_hour/whitelist 四项）
-- `main.py`：`initialize()` 中按 `quota.enabled` 创建 `QuotaManager`（try/except 降级），传给 `GenImgTool`；`terminate()` 中关闭。数据库路径 `StarTools.get_data_dir() / "quota.sqlite3"`
-- `core/tool.py`：`quota_manager` 字段（Any 类型避免 Pydantic schema 报错），`_do_call()` 中图片校验后、生成前调用 `try_acquire`，整个生成+发送流程包在 `try/finally` 中统一 refund。成功时返回剩余额度信息
+- `main.py`：`initialize()` 中按 `quota.enabled` 创建 `QuotaManager`（try/except 降级），`terminate()` 中关闭。数据库路径 `StarTools.get_data_dir() / "quota.sqlite3"`
+- `main.py`：`gen_img()` 方法中图片校验后、生成前调用 `try_acquire`，整个生成+发送流程包在 `try/finally` 中统一 refund。成功时返回剩余额度信息
 - `README.md`：新增"用户配额（quota）"配置说明文档
 
 ### 基础设施（v0.1.0）
@@ -82,6 +81,7 @@ astrbot_plugin_gen_img/
 | 决策 | 原因 |
 |------|------|
 | 单 Tool + model_group 参数（方案 A） | 比多 Tool 简单，靠 description 引导 Agent 选择 |
+| @llm_tool 装饰器注册（取代 FunctionTool 子类） | 解决 add_llm_tools() 在 AstrBot 权限过滤中 handler_module_path 不匹配导致的插件粒度控制失效问题 |
 | guide 渐进式加载（给 Agent 看） | 不污染系统提示词，不拼入最终 API 请求，按需展开 |
 | endpoints 多行文本格式 | 嵌套 template_list 在 WebUI 不可用，改为 `名称\|地址\|密钥\|模型` 多行文本，编辑直观 |
 | 旧配置自动迁移 | from_dict 识别 openrouter/newapi 合成为 default 模型组，平滑升级 |
@@ -95,7 +95,6 @@ astrbot_plugin_gen_img/
 | 配额"先扣后退"模式 | check→生成→consume 非原子会被并发绕过，改为 try_acquire 原子扣减 + 失败 refund |
 | 配额 date_key 精确回退 | try_acquire 返回 date_key，refund 按此回退，防止跨 reset_hour 边界退错周期 |
 | QuotaManager 初始化失败降级 | SQLite 打不开不应阻塞插件启动，降级为不限额并记录 warning |
-| quota_manager 字段用 Any 类型 | GenImgTool 是 pydantic.dataclasses，自定义类型会触发 PydanticSchemaGenerationError |
 
 ## 待完成
 
@@ -106,7 +105,7 @@ astrbot_plugin_gen_img/
 - [ ] 考虑 Pillow 是否需要加入 `requirements.txt`
 - [ ] 本地路径读取安全性：考虑目录白名单
 - [ ] 日志脱敏：评估路径/URL 前缀脱敏需求
-- [ ] 配额功能端到端联调验证
+- [ ] 端到端联调验证插件粒度权限控制：在 AstrBot 管理面板只允许本插件，确认 gen_img 可正常调用
 
 ## 架构速查
 
@@ -115,7 +114,7 @@ astrbot_plugin_gen_img/
     ↓
 AstrBot LLM Agent 推理
     ↓
-查看 gen_img Tool description → 了解可用模型组列表
+查看 gen_img @llm_tool description → 了解工具用途
     ↓
 ┌─ 首次使用？不传 prompt ──→ 返回该模型组的 guide（prompt 构建指南）
 │                              ↓
@@ -165,3 +164,8 @@ Tool 返回确认文本 + 剩余额度 → Agent 继续文字回复
 本轮完成：实现用户配额系统，新建 `core/quota.py` + 修改 5 文件 +180 行。SQLite "先扣后退"模式，Codex 三轮 review 修复全部 critical/warning（Pydantic 类型、并发绕过、date_key 跨日、异常路径漏退、初始化降级）
 主体更新：技术栈（+配额存储）、目录结构（+quota.py）、已完成（+用户配额系统）、关键决策（+4）、待完成（+配额联调）、架构速查（+配额环节）
 下一步：提交 git + 配额功能端到端联调验证
+
+### 2026-03-12 15:00
+本轮完成：工具注册机制从 `FunctionTool` 子类 + `add_llm_tools()` 迁移到 `@llm_tool()` 装饰器方式，修复 AstrBot 插件粒度权限过滤无法识别工具归属的问题。删除 `core/tool.py`，逻辑迁入 `main.py`（4 文件 +253/-394 行）。Codex review 通过
+主体更新：项目概况（注册方式描述）、目录结构（移除 tool.py）、已完成（动态模型组架构/配额系统描述更新）、关键决策（+@llm_tool 迁移）、待完成（+权限控制联调）
+下一步：提交 git + 端到端联调验证插件粒度权限控制
