@@ -7,7 +7,7 @@ Agent 推理后调用，插件负责按模型组路由到具体端点。
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,9 @@ _SYSTEM_HINT_MARKER = "<!-- gen_img_hint -->"
 # 模型组描述最大字符数（注入到系统提示词时截断）
 _DESC_MAX_LEN = 50
 
+# 跨调用降级记忆保留时长（秒），超过后视为新的独立请求
+_FALLBACK_TTL = 300.0
+
 
 @dataclass
 class RuntimeModelGroup:
@@ -40,6 +43,15 @@ class RuntimeModelGroup:
 
     config: ModelGroupConfig
     router: ProviderRouter
+
+
+@dataclass
+class _FallbackState:
+    """跨调用降级记忆：记录某模型组已尝试到第几个 provider。"""
+
+    provider_offset: int
+    created_at: float
+    accumulated_errors: list[str] = field(default_factory=list)
 
 
 @register("astrbot_plugin_gen_img", "用户", "动态模型组图片生成插件", "0.2.0")
@@ -51,6 +63,7 @@ class Main(Star):
         self.session: aiohttp.ClientSession | None = None
         self.runtime_groups: dict[str, RuntimeModelGroup] = {}
         self.quota_manager: QuotaManager | None = None
+        self._fallback_state: dict[str, _FallbackState] = {}
 
     async def initialize(self):
         """异步初始化：创建 HTTP 会话并装配模型组。"""
@@ -158,6 +171,52 @@ class Main(Star):
     def _new_deadline(self) -> float:
         """为一次图片生成流程创建 monotonic deadline。"""
         return asyncio.get_running_loop().time() + self.config.request.timeout
+
+    # ── 跨调用降级记忆 ──
+
+    def _get_fallback_offset(self, key: str) -> tuple[int, list[str]]:
+        """获取模型组的降级偏移量和累积错误，过期则重置。"""
+        state = self._fallback_state.get(key)
+        if state is None:
+            return 0, []
+        if asyncio.get_running_loop().time() - state.created_at > _FALLBACK_TTL:
+            del self._fallback_state[key]
+            return 0, []
+        return state.provider_offset, list(state.accumulated_errors)
+
+    def _advance_fallback(
+        self,
+        key: str,
+        offset: int,
+        providers_tried: int,
+        new_error: str,
+        total_providers: int,
+    ) -> tuple[int, list[str]]:
+        """推进降级状态，返回 (remaining_endpoints, all_errors)。"""
+        _, old_errors = self._get_fallback_offset(key)
+        # 去重追加新错误
+        for part in new_error.split("；"):
+            item = part.strip()
+            if item and item not in old_errors:
+                old_errors.append(item)
+
+        new_offset = offset + providers_tried
+        remaining = max(0, total_providers - new_offset)
+
+        if remaining > 0:
+            self._fallback_state[key] = _FallbackState(
+                provider_offset=new_offset,
+                created_at=asyncio.get_running_loop().time(),
+                accumulated_errors=old_errors,
+            )
+        else:
+            self._fallback_state.pop(key, None)
+
+        return remaining, old_errors
+
+    def _clear_fallback(self, key: str) -> None:
+        """成功后清除降级状态。"""
+        self._fallback_state.pop(key, None)
 
     # ── 图片解析辅助方法 ──
 
@@ -480,21 +539,52 @@ class Main(Star):
                     f"配额将在每天 {self.config.quota.reset_hour:02d}:00 重置。"
                 )
 
+        # 获取跨调用降级偏移量（key = 用户+模型组，隔离并发用户）
+        fallback_key = f"{event.get_sender_id()}:{group_name}"
+        fallback_offset, _ = self._get_fallback_offset(fallback_key)
+        total_providers = len(rtg.router.providers)
+
         logger.info(
             f"[gen_img] tool 调用 group={group_name} operation={operation} "
-            f"input_images={len(images)} prompt_len={len(prompt)}"
+            f"input_images={len(images)} prompt_len={len(prompt)} "
+            f"start_index={fallback_offset}/{total_providers}"
         )
 
         # ── 第五步：调用路由生成并发送 ──
         # 预扣后的所有操作包在 try/finally 中，失败时统一回退配额
         generation_ok = False
         try:
-            result = await rtg.router.generate(prompt, images, deadline=deadline)
+            result = await rtg.router.generate(
+                prompt, images, deadline=deadline, start_index=fallback_offset,
+            )
 
             if result.error or not result.images:
+                current_error = result.error or "图片生成失败，未返回图片结果。"
+
+                # 未实际尝试任何 provider（预算在进入前已耗尽），
+                # 视同当前端点尝试失败，强制推进 1 以避免死循环
+                tried = result.providers_tried or 1
+
+                remaining_eps, all_errors = self._advance_fallback(
+                    fallback_key,
+                    fallback_offset,
+                    tried,
+                    current_error,
+                    total_providers,
+                )
+                if remaining_eps > 0:
+                    return (
+                        f"{current_error}\n"
+                        f"还有 {remaining_eps} 个备用端点可尝试，"
+                        "请使用相同参数再次调用 gen_img 重试。\n"
+                        "禁止自行编造图片 URL 或假装图片已生成，"
+                        "请如实告知用户正在重试。"
+                    )
+                # 所有端点耗尽
+                final_error = "；".join(all_errors) or current_error
                 return (
-                    (result.error or "图片生成失败，未返回图片结果。")
-                    + "\n禁止自行编造图片 URL 或假装图片已生成，"
+                    f"所有 {total_providers} 个端点均已尝试失败：{final_error}\n"
+                    "禁止自行编造图片 URL 或假装图片已生成，"
                     "请如实告知用户生成失败。"
                 )
 
@@ -503,6 +593,7 @@ class Main(Star):
             if result.text:
                 chain.append(Comp.Plain(result.text))
             await event.send(MessageChain(chain=chain))
+            self._clear_fallback(fallback_key)
             generation_ok = True
         finally:
             if (

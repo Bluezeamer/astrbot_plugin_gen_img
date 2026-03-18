@@ -24,6 +24,7 @@ class RouterResult:
     text: str = ""
     provider_used: str = ""
     error: str = ""
+    providers_tried: int = 0
 
 
 class ProviderRouter:
@@ -52,6 +53,7 @@ class ProviderRouter:
         prompt: str,
         images: list[tuple[str, str]],
         deadline: float | None = None,
+        start_index: int = 0,
     ) -> RouterResult:
         if not self.providers:
             return RouterResult(error="当前没有可用的图片生成提供商，请检查配置。")
@@ -59,17 +61,22 @@ class ProviderRouter:
         if deadline is None:
             deadline = asyncio.get_running_loop().time() + self.request_timeout
 
+        start_index = max(0, min(start_index, len(self.providers)))
+        active_providers = self.providers[start_index:]
+
         errors: list[str] = []
         last_text = ""
         attempts = self.max_retry + 1  # 总尝试次数 = 重试次数 + 1
         budget_exhausted = False
+        providers_tried = 0
 
-        for provider in self.providers:
+        for provider in active_providers:
             remaining = self._remaining(deadline)
             if remaining < _MIN_ATTEMPT_SECONDS:
                 budget_exhausted = True
                 break
 
+            providers_tried += 1
             logger.info(
                 f"[gen_img] 路由 → {provider.name} "
                 f"max_attempts={attempts} input_images={len(images)} "
@@ -103,6 +110,7 @@ class ProviderRouter:
                         images=result.images,
                         text=result.text,
                         provider_used=provider.name,
+                        providers_tried=providers_tried,
                     )
 
                 # 可重试错误：在当前提供商内重试
@@ -142,6 +150,7 @@ class ProviderRouter:
                     text=result.text,
                     provider_used=provider.name,
                     error=err,
+                    providers_tried=providers_tried,
                 )
 
             if budget_exhausted:
@@ -150,4 +159,4 @@ class ProviderRouter:
         if budget_exhausted:
             errors.append("内部时间预算已耗尽")
         final_error = "；".join(dict.fromkeys(errors)) if errors else "所有提供商均未返回图片。"
-        return RouterResult(text=last_text, error=final_error)
+        return RouterResult(text=last_text, error=final_error, providers_tried=providers_tried)

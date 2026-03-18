@@ -1,6 +1,6 @@
 # astrbot_plugin_gen_img — 开发进度
 
-> 最后更新：2026-03-18 02:45
+> 最后更新：2026-03-18 03:56
 
 ## 项目概况
 
@@ -90,6 +90,16 @@ astrbot_plugin_gen_img/
 - `README.md`：timeout 默认值和说明同步更新
 - 共 7 文件 +199/-37 行
 
+### 跨调用降级记忆
+- **问题**：AstrBot 60s 硬超时下，慢模型（如 nanobanana2 ~50s/次）单次请求消耗整个预算，router 内部的重试和端点降级完全无法执行
+- **方案**：Agent 驱动重试 + 工具内部端点降级记忆。每次工具调用在 deadline 内尽量多试，失败后返回 Agent 并提示重试，下次调用自动从未试过的端点开始
+- `core/router.py`：`RouterResult` 新增 `providers_tried` 字段；`generate()` 新增 `start_index` 参数，从 `providers[start_index:]` 开始遍历；所有返回路径正确携带 `providers_tried`
+- `main.py`：新增 `_FALLBACK_TTL=300.0` 常量和 `_FallbackState` dataclass（provider_offset/created_at/accumulated_errors），key 为 `sender_id:group_name` 隔离并发用户
+- `main.py`：新增 `_get_fallback_offset()` / `_advance_fallback()` / `_clear_fallback()` 辅助方法，TTL 过期自动重置
+- `main.py`：`_do_gen_img()` 调用 router 前获取 offset，失败时推进 offset 并返回重试提示（"还有 N 个备用端点可尝试"），成功时清除状态，全部耗尽时返回累积错误
+- `providers_tried==0` 保护：未实际尝试任何 provider 时强制推进 1 以避免死循环
+- 2 文件 +107/-7 行
+
 ### 基础设施（v0.1.0）
 - 图片提取（`core/image_extract.py`）：本地路径/URL/data URI 统一解析，MIME 魔数检测，GIF 转 PNG，大小校验
 - 提供商请求（`core/provider.py`）：四层响应解析（images[] / markdown data URI / markdown URL / 结构化 content part），输出图下载限制 50MB
@@ -123,6 +133,9 @@ astrbot_plugin_gen_img/
 | deadline 时间预算机制 | AstrBot 60s 硬超时导致 CancelledError 杀死首次请求，改用 deadline 单调时钟全链路传递，确保重试/降级在预算内完成 |
 | CancelledError 启发式区分 | Python 3.10 无 `asyncio.timeout()`，用 deadline 余量（0.5s 容差）区分内部预算耗尽和外部取消，误判窗口极低 |
 | timeout 安全上限 55s | `_SAFE_CEILING = _ASTRBOT_TOOL_TIMEOUT - 5.0`，超过自动降回默认值并告警，预留 5s 余量给框架开销 |
+| 跨调用降级记忆（Agent 驱动重试） | AstrBot 60s 硬超时无法在单次调用内完成慢模型的多端点尝试，改为跨工具调用持久化降级偏移，端点路由对 Agent 透明 |
+| fallback key = sender_id:group_name | 按用户+模型组隔离状态，避免并发用户互相污染 fallback 偏移 |
+| _FALLBACK_TTL = 300s | 5 分钟内的重试视为同一请求链，超过后重置偏移从头开始 |
 
 ## 待完成
 
@@ -159,12 +172,15 @@ deadline = loop.time() + request_timeout（时间预算起点）
     ↓
 quota_manager.try_acquire(user_id) ──→ 配额不足？返回错误文本
     ↓（配额已预扣）
-RuntimeModelGroup.router.generate(deadline)
+RuntimeModelGroup.router.generate(deadline, start_index=fallback_offset)
     ↓
-┌─ endpoint 1 (主) ──→ 重试 max_retry 次（检查 deadline 预算）──→ 成功？返回
+┌─ endpoint 1 (主) ──→ 重试 max_retry 次（检查 deadline 预算）──→ 成功？返回 + 清除 fallback
 └─ 失败/降级 ──→ endpoint 2 (备) ──→ ...
-                                    └─ 全部失败 / 预算耗尽 → 错误文本
+                                    └─ 全部失败 / 预算耗尽
     ↓
+┌─ 还有未试端点？→ 更新 _fallback_state，返回重试提示 → Agent 再次调用
+└─ 全部耗尽？→ 清除 _fallback_state，返回累积错误
+    ↓（成功路径）
 event.send(MessageChain) → 直接发图给用户
     ↓（失败则 quota_manager.refund(user_id, date_key)）
 Tool 返回确认文本 + 剩余额度 → Agent 继续文字回复
@@ -216,3 +232,8 @@ Tool 返回确认文本 + 剩余额度 → Agent 继续文字回复
 本轮完成：修复 AstrBot 60s 硬超时导致重试/降级失效的架构问题，实现 deadline 时间预算全链路传递（7 文件 +199/-37 行），含 CancelledError 启发式区分、timeout 安全上限自动降级、per-download 预算重算。Codex 多轮 review 修复全部 critical/warning
 主体更新：已完成（+超时架构修复区块）、关键决策（+3）、架构速查（+deadline 流程）
 下一步：端到端联调验证超时降级行为 + SeedDream modalities:image 测试
+
+### 2026-03-18 03:56
+本轮完成：实现跨调用降级记忆，解决慢模型单次请求消耗整个 deadline 预算导致端点降级失效的问题（2 文件 +107/-7 行）。Codex review 修复 key 粒度和 providers_tried==0 死循环
+主体更新：已完成（+跨调用降级记忆区块）、关键决策（+3）、架构速查（+fallback 流程）
+下一步：部署验证慢模型跨调用端点降级行为
