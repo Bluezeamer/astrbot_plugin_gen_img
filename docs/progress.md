@@ -1,6 +1,6 @@
 # astrbot_plugin_gen_img — 开发进度
 
-> 最后更新：2026-03-12 15:30
+> 最后更新：2026-03-18 02:45
 
 ## 项目概况
 
@@ -78,6 +78,18 @@ astrbot_plugin_gen_img/
 - `main.py`：更新 `gen_img` docstring，引导 Agent 优先从系统提示词获取模型组信息，保留兜底恢复描述
 - 三层信息传递设计：系统提示词预注入（首轮即可选对）→ 工具兜底返回（错误恢复）→ guide 按需获取（详细 prompt 指南）
 
+### 超时架构修复：deadline 时间预算机制
+- **问题**：AstrBot 对工具执行有 60 秒硬超时（`asyncio.wait_for(60)`），插件原默认 timeout=120s，导致 `CancelledError` 在首次请求中途杀死任务，重试/降级逻辑完全无法执行
+- **方案**：基于 `asyncio.get_running_loop().time()` 单调时钟的 deadline 时间预算机制，从入口到最底层全链路传递
+- `core/config.py`：timeout 默认 120→50；新增 `_ASTRBOT_TOOL_TIMEOUT=60.0` 常量和 `_build_request_config()` 辅助函数，自动将 >55s 的 timeout 降回默认值并告警
+- `core/router.py`：新增 `_remaining(deadline)` 辅助方法和 `_MIN_ATTEMPT_SECONDS=2.0` 守卫；generate() 创建 deadline 并在每次尝试前检查预算，重试 sleep 前也做预算判断
+- `core/provider.py`：generate() 接受 deadline 参数；新增 `_effective_timeout(deadline)` / `_deadline_exceeded(deadline)` 辅助方法；CancelledError 捕获+启发式区分内部预算耗尽 vs 外部取消（`_CANCEL_GRACE_SECONDS=0.5`）；deadline 传递到 `_parse_response` → `_extract_from_text` → `_consume_candidate` 全链路
+- `core/image_extract.py`：`resolve_image_refs()` 新增 deadline 参数，每次 HTTP 下载前重算剩余时间防止串行下载耗尽预算
+- `main.py`：入口处创建 deadline 并传递给 `resolve_image_refs()` 和 `router.generate()`
+- `_conf_schema.json`：timeout 默认 120→50，hint 更新说明 AstrBot 60s 约束
+- `README.md`：timeout 默认值和说明同步更新
+- 共 7 文件 +199/-37 行
+
 ### 基础设施（v0.1.0）
 - 图片提取（`core/image_extract.py`）：本地路径/URL/data URI 统一解析，MIME 魔数检测，GIF 转 PNG，大小校验
 - 提供商请求（`core/provider.py`）：四层响应解析（images[] / markdown data URI / markdown URL / 结构化 content part），输出图下载限制 50MB
@@ -108,6 +120,9 @@ astrbot_plugin_gen_img/
 | 三层信息传递：预注入 + 兜底 + guide | 预注入解决首轮选择，兜底覆盖错误恢复，guide 保持按需获取避免污染系统提示词 |
 | HTML 注释 marker 去重 | `on_llm_request` 可能多次触发，用固定标记防止重复追加 |
 | 描述截断 50 字符 + 总长 800 字符安全阀 | 防止用户配置过长描述导致系统提示词膨胀 |
+| deadline 时间预算机制 | AstrBot 60s 硬超时导致 CancelledError 杀死首次请求，改用 deadline 单调时钟全链路传递，确保重试/降级在预算内完成 |
+| CancelledError 启发式区分 | Python 3.10 无 `asyncio.timeout()`，用 deadline 余量（0.5s 容差）区分内部预算耗尽和外部取消，误判窗口极低 |
+| timeout 安全上限 55s | `_SAFE_CEILING = _ASTRBOT_TOOL_TIMEOUT - 5.0`，超过自动降回默认值并告警，预留 5s 余量给框架开销 |
 
 ## 待完成
 
@@ -137,16 +152,18 @@ AstrBot LLM Agent 推理（已知可用模型组列表 + 调用规则）
 │                              ↓
 └─ 调用 gen_img(model_group=..., prompt=..., operation=..., image_urls=...)
     ↓
-┌─ img2img ──→ resolve_image_refs() ──→ [(mime, b64), ...]
+deadline = loop.time() + request_timeout（时间预算起点）
+    ↓
+┌─ img2img ──→ resolve_image_refs(deadline) ──→ [(mime, b64), ...]
 └─ txt2img ──→ images = []（跳过图片提取）
     ↓
 quota_manager.try_acquire(user_id) ──→ 配额不足？返回错误文本
     ↓（配额已预扣）
-RuntimeModelGroup.router.generate()
+RuntimeModelGroup.router.generate(deadline)
     ↓
-┌─ endpoint 1 (主) ──→ 成功？返回
+┌─ endpoint 1 (主) ──→ 重试 max_retry 次（检查 deadline 预算）──→ 成功？返回
 └─ 失败/降级 ──→ endpoint 2 (备) ──→ ...
-                                    └─ 全部失败 → 错误文本
+                                    └─ 全部失败 / 预算耗尽 → 错误文本
     ↓
 event.send(MessageChain) → 直接发图给用户
     ↓（失败则 quota_manager.refund(user_id, date_key)）
@@ -194,3 +211,8 @@ Tool 返回确认文本 + 剩余额度 → Agent 继续文字回复
 本轮完成：增强工具提示词引导，解决 Agent 多模型组盲选、默认 operation 误判、失败后幻觉图片三个实际问题。新增 `_build_groups_overview()`/`_build_group_info()` 辅助方法，优化全部返回路径的提示文本，`None` 参数防御性处理。Codex review 修复条件化输出等问题
 主体更新：关键决策（+2：运行时信息注入、禁止编造约束）
 下一步：部署验证提示词引导效果 + 端到端联调
+
+### 2026-03-18 02:45
+本轮完成：修复 AstrBot 60s 硬超时导致重试/降级失效的架构问题，实现 deadline 时间预算全链路传递（7 文件 +199/-37 行），含 CancelledError 启发式区分、timeout 安全上限自动降级、per-download 预算重算。Codex 多轮 review 修复全部 critical/warning
+主体更新：已完成（+超时架构修复区块）、关键决策（+3）、架构速查（+deadline 流程）
+下一步：端到端联调验证超时降级行为 + SeedDream modalities:image 测试

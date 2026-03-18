@@ -138,8 +138,8 @@
             "timeout": {
                 "description": "请求超时时间（秒）",
                 "type": "int",
-                "default": 120,
-                "hint": "图片生成通常需要较长时间，建议不低于 60 秒。"
+                "default": 50,
+                "hint": "整条生成链路（含重试和降级）的时间预算。AstrBot 工具硬超时为 60 秒，此值必须低于 55 以预留余量。"
             },
             "max_retry": {
                 "description": "每个端点的最大重试次数",

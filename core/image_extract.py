@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 from pathlib import Path
@@ -162,6 +163,7 @@ async def resolve_image_refs(
     session: aiohttp.ClientSession,
     image_config: ImageConfig,
     timeout: float,
+    deadline: float | None = None,
 ) -> list[tuple[str, str]]:
     """统一处理 Agent 传入的图片引用列表。
 
@@ -169,6 +171,9 @@ async def resolve_image_refs(
     - 本地文件路径（如 /tmp/img.png）
     - HTTP/HTTPS URL
     - data:image/... URI
+
+    当提供 deadline 时，每次 HTTP 下载前重算剩余时间，防止多张图片
+    串行下载耗尽时间预算。timeout 仅作为单次下载的上限。
 
     返回 [(mime, base64_str), ...]
     """
@@ -188,12 +193,22 @@ async def resolve_image_refs(
             if ref.startswith("data:image/"):
                 results.append(parse_data_uri(ref, max_mb=image_config.max_input_mb))
             elif ref.startswith("http://") or ref.startswith("https://"):
+                # 每次下载前重算剩余时间
+                dl_timeout = min(timeout, 60.0)
+                if deadline is not None:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        logger.warning(
+                            f"[gen_img] 输入图下载预算耗尽，跳过剩余 ref={ref[:80]}"
+                        )
+                        break
+                    dl_timeout = min(dl_timeout, remaining)
                 results.append(
                     await download_image(
                         session=session,
                         url=ref,
                         max_mb=image_config.max_input_mb,
-                        timeout=min(timeout, 60.0),
+                        timeout=dl_timeout,
                     )
                 )
             else:

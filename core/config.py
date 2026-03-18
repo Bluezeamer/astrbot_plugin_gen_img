@@ -127,7 +127,13 @@ class EndpointConfig:
 
 @dataclass
 class RequestConfig:
-    timeout: float = 120.0
+    """请求控制参数。
+
+    timeout 同时作为单次网络请求上限和整条生成链路的默认时间预算。
+    默认 50 秒，为 AstrBot 外层 60 秒工具硬超时预留余量。
+    """
+
+    timeout: float = 50.0
     max_retry: int = 2
 
 
@@ -180,6 +186,29 @@ class ModelGroupConfig:
     endpoints: list[EndpointConfig] = field(default_factory=list)
 
 
+# AstrBot 工具硬超时（asyncio.wait_for），不可更改
+_ASTRBOT_TOOL_TIMEOUT = 60.0
+
+
+def _build_request_config(rq_data: dict[str, Any], defaults: RequestConfig) -> RequestConfig:
+    """解析请求配置并校验 timeout 安全性。"""
+    # AstrBot 工具硬超时 60s，需为配额回退/消息发送/日志等尾部操作预留余量
+    _SAFE_CEILING = _ASTRBOT_TOOL_TIMEOUT - 5.0  # 55s
+    timeout = max(1.0, _float(rq_data.get("timeout"), defaults.timeout))
+    if timeout > _SAFE_CEILING:
+        logger.warning(
+            f"[gen_img] request.timeout={timeout}s 超过安全上限"
+            f"（{_SAFE_CEILING}s），已自动降为 {defaults.timeout}s。"
+            f"AstrBot 工具硬超时为 {_ASTRBOT_TOOL_TIMEOUT}s，"
+            "请在管理面板将 timeout 调至 55 以内。"
+        )
+        timeout = defaults.timeout
+    return RequestConfig(
+        timeout=timeout,
+        max_retry=max(0, _int(rq_data.get("max_retry"), defaults.max_retry)),
+    )
+
+
 @dataclass
 class PluginConfig:
     fallback_to_event_images: bool = True
@@ -224,14 +253,7 @@ class PluginConfig:
             ),
             default_image_config=default_image_config,
             model_groups=model_groups,
-            request=RequestConfig(
-                timeout=max(
-                    1.0, _float(rq_data.get("timeout"), defaults.request.timeout)
-                ),
-                max_retry=max(
-                    0, _int(rq_data.get("max_retry"), defaults.request.max_retry)
-                ),
-            ),
+            request=_build_request_config(rq_data, defaults.request),
             image=ImageConfig(
                 max_input_images=max(
                     1,

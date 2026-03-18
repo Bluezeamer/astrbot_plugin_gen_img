@@ -36,6 +36,12 @@ _HTTP_RE = re.compile(r"^https?://", re.IGNORECASE)
 _OUTPUT_MAX_MB = 50
 _RETRYABLE_STATUS = {408, 500, 502, 503, 504}
 _NO_RETRY_STATUS = {400, 401, 403, 404, 422}
+# CancelledError 判定容差：deadline 剩余低于此值视为预算耗尽而非外部取消。
+# 注意：Python 3.10 无 asyncio.timeout()，无法建立独立的内部取消源，
+# 因此用 deadline 余量启发式区分内部/外部取消。由于内部 deadline（默认 50s）
+# 远早于 AstrBot 硬超时（60s），误判窗口约 0.5s，实际风险极低。
+# 当项目最低版本升至 3.11 后，可改用 asyncio.timeout() 精确区分。
+_CANCEL_GRACE_SECONDS = 0.5
 
 
 def _is_json(text: str) -> bool:
@@ -80,18 +86,25 @@ class OpenAICompatibleProvider:
         self,
         prompt: str,
         images: list[tuple[str, str]],
+        deadline: float | None = None,
     ) -> ProviderResult:
         """发送图片生成请求并解析响应。"""
         err = self._check_config()
         if err:
             return err
 
+        request_timeout = self._effective_timeout(deadline)
+        if request_timeout <= 0:
+            return ProviderResult(
+                error=f"{self.name} 剩余时间不足，跳过请求", retryable=True
+            )
+
         payload = self._build_payload(prompt, images)
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
         }
-        timeout = aiohttp.ClientTimeout(total=self.request_config.timeout)
+        timeout = aiohttp.ClientTimeout(total=request_timeout)
 
         try:
             async with self.session.post(
@@ -102,6 +115,12 @@ class OpenAICompatibleProvider:
             ) as resp:
                 raw = await resp.text()
                 status = resp.status
+        except asyncio.CancelledError:
+            if self._deadline_exceeded(deadline):
+                return ProviderResult(
+                    error=f"{self.name} 请求被取消（时间预算耗尽）", retryable=True
+                )
+            raise
         except asyncio.TimeoutError:
             return ProviderResult(error=f"{self.name} 请求超时", retryable=True)
         except aiohttp.ClientError as exc:
@@ -119,7 +138,32 @@ class OpenAICompatibleProvider:
                 should_fallback=True,
             )
 
-        return await self._parse_response(data, status)
+        try:
+            return await self._parse_response(data, status, deadline=deadline)
+        except asyncio.CancelledError:
+            if self._deadline_exceeded(deadline):
+                return ProviderResult(
+                    error=f"{self.name} 响应解析被取消（时间预算耗尽）",
+                    status_code=status,
+                    retryable=True,
+                )
+            raise
+
+    # ── 时间预算辅助 ──────────────────────────────────────
+
+    def _effective_timeout(self, deadline: float | None) -> float:
+        """根据 deadline 计算当前请求可用的超时秒数。"""
+        base = max(0.0, self.request_config.timeout)
+        if deadline is None:
+            return base
+        remaining = deadline - asyncio.get_running_loop().time()
+        return max(0.0, min(base, remaining))
+
+    def _deadline_exceeded(self, deadline: float | None) -> bool:
+        """判断是否已接近或超过内部 deadline（容差 _CANCEL_GRACE_SECONDS）。"""
+        if deadline is None:
+            return False
+        return self._effective_timeout(deadline) <= _CANCEL_GRACE_SECONDS
 
     # ── 请求构造 ──────────────────────────────────────────
 
@@ -207,7 +251,12 @@ class OpenAICompatibleProvider:
 
     # ── 响应解析 ──────────────────────────────────────────
 
-    async def _parse_response(self, data: dict, status: int) -> ProviderResult:
+    async def _parse_response(
+        self,
+        data: dict,
+        status: int,
+        deadline: float | None = None,
+    ) -> ProviderResult:
         """解析 Chat Completions 响应，提取图片。
 
         兼容两种顶层格式：
@@ -228,7 +277,7 @@ class OpenAICompatibleProvider:
                 # url 格式
                 url = item.get("url", "")
                 if isinstance(url, str) and url:
-                    failed = await self._consume_candidate(url, images)
+                    failed = await self._consume_candidate(url, images, deadline=deadline)
                     download_failed = download_failed or failed
                 # b64_json 格式
                 b64 = item.get("b64_json") or item.get("base64")
@@ -281,14 +330,14 @@ class OpenAICompatibleProvider:
                     else:
                         url = img_item.get("url", "")
                     if url:
-                        failed = await self._consume_candidate(url, images)
+                        failed = await self._consume_candidate(url, images, deadline=deadline)
                         download_failed = download_failed or failed
 
             content = message.get("content")
 
             # ── 情况 1：content 是字符串 ──
             if isinstance(content, str):
-                failed = await self._extract_from_text(content, images, seen)
+                failed = await self._extract_from_text(content, images, seen, deadline=deadline)
                 download_failed = download_failed or failed
                 # 清理 text：去掉图片相关内容
                 clean = _MD_IMG_RE.sub("", content)
@@ -310,7 +359,7 @@ class OpenAICompatibleProvider:
 
                     if ptype == "text" and isinstance(part.get("text"), str):
                         text_val = part["text"]
-                        failed = await self._extract_from_text(text_val, images, seen)
+                        failed = await self._extract_from_text(text_val, images, seen, deadline=deadline)
                         download_failed = download_failed or failed
                         clean = _MD_IMG_RE.sub("", text_val)
                         clean = _DATA_URI_RE.sub("", clean).strip()
@@ -326,7 +375,7 @@ class OpenAICompatibleProvider:
                         else:
                             url = ""
                         if url:
-                            failed = await self._consume_candidate(url, images)
+                            failed = await self._consume_candidate(url, images, deadline=deadline)
                             download_failed = download_failed or failed
 
                     # 有些 API 直接返回 b64_json
@@ -353,7 +402,11 @@ class OpenAICompatibleProvider:
         )
 
     async def _extract_from_text(
-        self, text: str, images: list[tuple[str, str]], seen: set[str]
+        self,
+        text: str,
+        images: list[tuple[str, str]],
+        seen: set[str],
+        deadline: float | None = None,
     ) -> bool:
         """从文本中提取图片，返回是否有下载失败。
 
@@ -366,7 +419,7 @@ class OpenAICompatibleProvider:
             candidate = match.group(1).strip().strip("<>")
             if candidate and candidate not in seen:
                 seen.add(candidate)
-                failed = await self._consume_candidate(candidate, images)
+                failed = await self._consume_candidate(candidate, images, deadline=deadline)
                 download_failed = download_failed or failed
 
         # 非 markdown 包裹的 data URI（避免与上面重复）
@@ -394,7 +447,7 @@ class OpenAICompatibleProvider:
                     url = item.get("url", "")
                     if isinstance(url, str) and url and url not in seen:
                         seen.add(url)
-                        failed = await self._consume_candidate(url, images)
+                        failed = await self._consume_candidate(url, images, deadline=deadline)
                         download_failed = download_failed or failed
                     b64 = item.get("b64_json") or item.get("base64")
                     if isinstance(b64, str) and b64:
@@ -406,13 +459,16 @@ class OpenAICompatibleProvider:
             candidate = stripped.split()[0]  # 取第一个 token 防止尾随文字
             if candidate not in seen:
                 seen.add(candidate)
-                failed = await self._consume_candidate(candidate, images)
+                failed = await self._consume_candidate(candidate, images, deadline=deadline)
                 download_failed = download_failed or failed
 
         return download_failed
 
     async def _consume_candidate(
-        self, candidate: str, images: list[tuple[str, str]]
+        self,
+        candidate: str,
+        images: list[tuple[str, str]],
+        deadline: float | None = None,
     ) -> bool:
         """处理单个图片候选（data URI 或 HTTP URL），返回是否失败。"""
         if candidate.startswith("data:image/"):
@@ -424,12 +480,16 @@ class OpenAICompatibleProvider:
             return False
 
         if _HTTP_RE.match(candidate):
+            dl_timeout = min(self._effective_timeout(deadline), 60.0)
+            if dl_timeout <= 0:
+                logger.warning(f"[gen_img] {self.name} 结果图下载预算耗尽，跳过: {candidate[:80]}")
+                return True
             try:
                 img = await download_image(
                     session=self.session,
                     url=candidate,
                     max_mb=_OUTPUT_MAX_MB,
-                    timeout=min(self.request_config.timeout, 60.0),
+                    timeout=dl_timeout,
                 )
                 images.append(img)
                 return False

@@ -94,7 +94,7 @@ newapi | https://your-newapi.com/v1/chat/completions | sk-yyy | gemini-image
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
 | `fallback_to_event_images` | Agent 未传图片时从消息中自动提取 | `true` |
-| `request.timeout` | 请求超时秒数 | `120` |
+| `request.timeout` | 生成链路时间预算（秒），须低于 55 | `50` |
 | `request.max_retry` | 每个端点的重试次数 | `2` |
 | `image.max_input_images` | 最大输入图片数 | `3` |
 | `image.max_input_mb` | 单张图片大小限制（MB） | `20` |

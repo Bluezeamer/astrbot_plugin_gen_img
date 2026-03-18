@@ -6,6 +6,7 @@ Agent 推理后调用，插件负责按模型组路由到具体端点。
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -129,6 +130,7 @@ class Main(Star):
                 router=ProviderRouter(
                     providers=providers,
                     max_retry=self.config.request.max_retry,
+                    request_timeout=self.config.request.timeout,
                 ),
             )
             ep_names = ", ".join(p.name for p in providers)
@@ -153,12 +155,17 @@ class Main(Star):
 
         self.runtime_groups = {}
 
+    def _new_deadline(self) -> float:
+        """为一次图片生成流程创建 monotonic deadline。"""
+        return asyncio.get_running_loop().time() + self.config.request.timeout
+
     # ── 图片解析辅助方法 ──
 
     async def _resolve_images(
         self,
         event: AstrMessageEvent,
         raw_image_urls: Any,
+        deadline: float | None = None,
     ) -> list[tuple[str, str]]:
         """提取并解析图片引用，仅在 img2img 时调用。"""
         if self.session is None:
@@ -179,6 +186,13 @@ class Main(Star):
         else:
             image_refs = []
 
+        # 计算图片下载可用的超时：取 deadline 剩余和配置超时的较小值
+        if deadline is not None:
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            dl_timeout = min(self.config.request.timeout, remaining)
+        else:
+            dl_timeout = self.config.request.timeout
+
         # Agent 传了图片路径：直接解析
         if image_refs:
             logger.info(f"[gen_img] Agent 传入 {len(image_refs)} 张图片引用")
@@ -186,7 +200,8 @@ class Main(Star):
                 refs=image_refs,
                 session=self.session,
                 image_config=self.config.image,
-                timeout=self.config.request.timeout,
+                timeout=dl_timeout,
+                deadline=deadline,
             )
 
         # 未传图片：fallback 从消息事件中提取
@@ -203,7 +218,8 @@ class Main(Star):
                     refs=event_refs,
                     session=self.session,
                     image_config=self.config.image,
-                    timeout=self.config.request.timeout,
+                    timeout=dl_timeout,
+                    deadline=deadline,
                 )
 
         return []
@@ -429,9 +445,10 @@ class Main(Star):
             )
 
         # ── 第四步：根据 operation 处理图片 ──
+        deadline = self._new_deadline()
         images: list[tuple[str, str]] = []
         if operation == "img2img":
-            images = await self._resolve_images(event, image_urls)
+            images = await self._resolve_images(event, image_urls, deadline=deadline)
             if not images:
                 hint = ""
                 if group_cfg.support_txt2img:
@@ -472,7 +489,7 @@ class Main(Star):
         # 预扣后的所有操作包在 try/finally 中，失败时统一回退配额
         generation_ok = False
         try:
-            result = await rtg.router.generate(prompt, images)
+            result = await rtg.router.generate(prompt, images, deadline=deadline)
 
             if result.error or not result.images:
                 return (
